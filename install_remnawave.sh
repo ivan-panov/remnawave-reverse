@@ -1,13 +1,21 @@
 #!/bin/bash
 
-SCRIPT_VERSION="3.0.0-cascade-api-docker-u2404-awg3-v5240"
-CUSTOM_BUILD=true
+SCRIPT_VERSION="3.0.0-cascade-api-docker-u2404-awg3-v5240-ivan1"
+CUSTOM_BUILD=false
+
+# Repository used for installation and self-updates. It can be overridden for
+# testing without editing the script:
+#   REMNAWAVE_REVERSE_REPO=owner/repo REMNAWAVE_REVERSE_BRANCH=branch ./install_remnawave.sh
+REPOSITORY_SLUG="${REMNAWAVE_REVERSE_REPO:-ivan-panov/remnawave-reverse}"
+REPOSITORY_BRANCH="${REMNAWAVE_REVERSE_BRANCH:-main}"
+RAW_BASE_URL="https://raw.githubusercontent.com/${REPOSITORY_SLUG}/refs/heads/${REPOSITORY_BRANCH}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UPDATE_AVAILABLE=false
 DIR_REMNAWAVE="/usr/local/remnawave_reverse/"
 LANG_FILE="${DIR_REMNAWAVE}selected_language"
-SCRIPT_URL="https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh"
-LANG_BASE_URL="https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/src/lang"
+SCRIPT_URL="${RAW_BASE_URL}/install_remnawave.sh"
+LANG_BASE_URL="${RAW_BASE_URL}/src/lang"
+MODULE_BASE_URL="${RAW_BASE_URL}/src"
 
 COLOR_RESET="\033[0m"
 COLOR_GREEN="\033[1;32m"
@@ -2262,7 +2270,7 @@ load_module() {
     local module_name="$1"
     local module_type="${2:-modules}"
     local module_file="${DIR_REMNAWAVE}${module_type}/${module_name}.sh"
-    local module_url="https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/dev/src/${module_type}/${module_name}.sh"
+    local module_url="${MODULE_BASE_URL}/${module_type}/${module_name}.sh"
     local force_update="${3:-false}"
 
     if [ "$force_update" = "true" ] || [ ! -f "$module_file" ]; then

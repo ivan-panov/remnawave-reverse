@@ -1,8 +1,8 @@
-<p aling="center"><a href="https://github.com/eGamesAPI/remnawave-reverse-proxy">
+<p aling="center"><a href="https://github.com/ivan-panov/remnawave-reverse">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="./media/logo.png" />
    <source media="(prefers-color-scheme: light)" srcset="./media/logo-black.png" />
-   <img alt="Remnawave Reverse Proxy" src="https://github.com/eGamesAPI/remnawave-reverse-proxy" />
+   <img alt="Remnawave Reverse Proxy" src="https://github.com/ivan-panov/remnawave-reverse" />
  </picture>
 </a></p>
 
@@ -172,7 +172,7 @@ The panel remains invisible without the correct authentication parameter.
 
 Execute the following command to begin installation:
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/eGamesAPI/remnawave-reverse-proxy/refs/heads/main/install_remnawave.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ivan-panov/remnawave-reverse/refs/heads/main/install_remnawave.sh)
 ```
 
 <p align="center">

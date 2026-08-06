@@ -56,10 +56,10 @@ export default defineConfig({
 				},
 			},
 			editLink: {
-				baseUrl: "https://github.com/eGamesAPI/remnawave-reverse-proxy/edit/main/docs/",
+				baseUrl: "https://github.com/ivan-panov/remnawave-reverse/edit/main/docs/",
 			},
 			social: [
-				{ icon: 'github', label: 'GitHub', href: 'https://github.com/eGamesAPI/remnawave-reverse-proxy/' },
+				{ icon: 'github', label: 'GitHub', href: 'https://github.com/ivan-panov/remnawave-reverse/' },
 				{ icon: 'telegram', label: 'Telegram', href: 'https://t.me/remnawave_reverse' },
 				{ icon: 'seti:zip', label: 'Used resources', href: '/contribution/resources' }
 			],
