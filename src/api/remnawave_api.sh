@@ -458,32 +458,175 @@ update_squad() {
     return 0
 }
 
+_upsert_env_secret() {
+    local env_file="$1"
+    local key="$2"
+    local value="$3"
+    local tmp_file found=false line
+
+    [ -f "$env_file" ] || : > "$env_file"
+    tmp_file=$(mktemp "${env_file}.tmp.XXXXXX") || return 1
+    chmod 600 "$tmp_file"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" == "${key}="* ]]; then
+            printf '%s=%s\n' "$key" "$value" >> "$tmp_file"
+            found=true
+        else
+            printf '%s\n' "$line" >> "$tmp_file"
+        fi
+    done < "$env_file"
+
+    if [ "$found" != true ]; then
+        printf '\n%s=%s\n' "$key" "$value" >> "$tmp_file"
+    fi
+
+    mv -f "$tmp_file" "$env_file"
+    chmod 600 "$env_file"
+}
+
+_configure_subscription_token_reference() {
+    local compose_file="$1"
+
+    [ -f "$compose_file" ] || return 1
+
+    if grep -q 'REMNAWAVE_API_TOKEN=' "$compose_file"; then
+        sed -i 's|REMNAWAVE_API_TOKEN=.*|REMNAWAVE_API_TOKEN=${REMNAWAVE_API_TOKEN}|' "$compose_file"
+    else
+        echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}: REMNAWAVE_API_TOKEN is absent in docker-compose.yml${COLOR_RESET}" >&2
+        return 1
+    fi
+
+    grep -Fq 'REMNAWAVE_API_TOKEN=${REMNAWAVE_API_TOKEN}' "$compose_file"
+}
+
 create_api_token() {
-    local domain_url=$1
-    local token=$2
-    local target_dir=$3
+    local domain_url="$1"
+    local token="$2"
+    local target_dir="$3"
     local token_name="${4:-subscription-page}"
+    local max_attempts="${5:-12}"
+    local retry_delay="${6:-5}"
+    local attempt response body http_code api_token token_data request_name
 
-    local token_data='{"tokenName":"'"$token_name"'"}'
-    local api_response
-    api_response=$(make_api_request "POST" "http://$domain_url/api/tokens" "$token" "$token_data")
-
-    if [ -z "$api_response" ]; then
-        echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}${COLOR_RESET}" >&2
+    [ -n "$token" ] || {
+        echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}: admin JWT is empty${COLOR_RESET}" >&2
         return 1
-    fi
-
-    local api_token
-    api_token=$(echo "$api_response" | jq -r '.response.token')
-
-    if [ -z "$api_token" ] || [ "$api_token" = "null" ]; then
-        echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}: $(echo "$api_response" | jq -r '.message // "Unknown error"')" >&2
+    }
+    [ -f "$target_dir/.env" ] || {
+        echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}: $target_dir/.env not found${COLOR_RESET}" >&2
         return 1
+    }
+
+    request_name="$token_name"
+
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        token_data=$(jq -nc --arg tokenName "$request_name" '{tokenName:$tokenName}') || return 1
+
+        response=$(curl -sS --connect-timeout 5 --max-time 30 \
+            -X POST "http://$domain_url/api/tokens" \
+            -H "Authorization: Bearer $token" \
+            -H 'Content-Type: application/json' \
+            -H 'X-Remnawave-Client-Type: browser' \
+            -d "$token_data" \
+            -w $'\n%{http_code}') || response=""
+
+        if [[ "$response" == *$'\n'* ]]; then
+            http_code="${response##*$'\n'}"
+            body="${response%$'\n'*}"
+        else
+            http_code="000"
+            body="$response"
+        fi
+
+        if [[ "$http_code" =~ ^20[01]$ ]] && printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+            api_token=$(printf '%s' "$body" | jq -r '
+                (.response.token //
+                 .response.apiToken //
+                 .response.apiKey //
+                 .token //
+                 .apiToken //
+                 .apiKey //
+                 empty) |
+                if type == "object" then
+                    (.token // .value // .apiToken // .apiKey // empty)
+                else
+                    .
+                end
+            ' 2>/dev/null)
+
+            if [ -n "$api_token" ] && [ "$api_token" != "null" ] && [ "${#api_token}" -ge 20 ]; then
+                _upsert_env_secret "$target_dir/.env" "REMNAWAVE_API_TOKEN" "$api_token" || {
+                    unset api_token
+                    echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}: unable to write .env${COLOR_RESET}" >&2
+                    return 1
+                }
+                _configure_subscription_token_reference "$target_dir/docker-compose.yml" || {
+                    unset api_token
+                    return 1
+                }
+                unset api_token body response
+                echo -e "${COLOR_GREEN}${LANG[API_TOKEN_ADDED]}${COLOR_RESET}" >&2
+                return 0
+            fi
+        fi
+
+        # A previous interrupted installation may already have created this name.
+        # API tokens are shown only once, so retry with a unique name instead of
+        # trying to reuse an unrecoverable secret.
+        if [ "$http_code" = "409" ]; then
+            request_name="${token_name}-$(date +%Y%m%d%H%M%S)-${attempt}"
+        fi
+
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            echo -e "${COLOR_YELLOW}${LANG[API_TOKEN_RETRY]} ${attempt}/${max_attempts} (HTTP ${http_code})${COLOR_RESET}" >&2
+            sleep "$retry_delay"
+        fi
+    done
+
+    local api_message=""
+    if printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+        api_message=$(printf '%s' "$body" | jq -r '.message // .error // .errorCode // empty' 2>/dev/null)
     fi
+    [ -n "$api_message" ] || api_message="HTTP ${http_code}"
+    echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}: ${api_message}${COLOR_RESET}" >&2
+    return 1
+}
 
-    sed -i "s|REMNAWAVE_API_TOKEN=.*|REMNAWAVE_API_TOKEN=$api_token|" "$target_dir/docker-compose.yml"
+verify_subscription_page_runtime() {
+    local target_dir="$1"
+    local max_attempts="${2:-24}"
+    local delay="${3:-5}"
+    local attempt state health token_present
 
-    sleep 1
+    (
+        cd "$target_dir" || exit 1
+        docker compose config -q && \
+        docker compose up -d --force-recreate --no-deps remnawave-subscription-page
+    ) >/dev/null 2>&1 || {
+        echo -e "${COLOR_RED}${LANG[SUBPAGE_START_FAILED]}${COLOR_RESET}" >&2
+        return 1
+    }
 
-    echo -e "${COLOR_GREEN}${LANG[API_TOKEN_ADDED]}${COLOR_RESET}" >&2
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        state=$(docker inspect -f '{{.State.Status}}' remnawave-subscription-page 2>/dev/null || true)
+        health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' remnawave-subscription-page 2>/dev/null || true)
+        token_present=$(docker inspect remnawave-subscription-page \
+            --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | \
+            awk -F= '/^REMNAWAVE_API_TOKEN=/{if (length($2) >= 20) print "yes"}')
+
+        if [ "$state" = "running" ] && [ "$token_present" = "yes" ] && { [ "$health" = "healthy" ] || [ "$health" = "none" ]; }; then
+            echo -e "${COLOR_GREEN}${LANG[SUBPAGE_TOKEN_READY]}${COLOR_RESET}" >&2
+            return 0
+        fi
+
+        if [ "$state" = "exited" ] || [ "$state" = "dead" ]; then
+            break
+        fi
+        sleep "$delay"
+    done
+
+    echo -e "${COLOR_RED}${LANG[SUBPAGE_HEALTH_TIMEOUT]}${COLOR_RESET}" >&2
+    docker logs --tail=80 remnawave-subscription-page >&2 2>/dev/null || true
+    return 1
 }

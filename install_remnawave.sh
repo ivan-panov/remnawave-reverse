@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="3.0.0-cascade-api-docker-u2404-awg3-v5240-ivan1"
+SCRIPT_VERSION="3.0.1"
 CUSTOM_BUILD=false
 
 # Repository used for installation and self-updates. It can be overridden for

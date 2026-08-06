@@ -318,3 +318,7 @@ Telegram-чат: [https://t.me/remnawave_reverse](https://t.me/remnawave_reverse
 ## Пожертвования
 
 - **TON USDT:** `UQAxyZDwKUPQ5Bp09JOFcaDVakjYQT46rf3iP3lnl_qc9xVS`
+
+### Автоматическая настройка Subscription Page
+
+Во время установки скрипт ожидает готовности локального API панели, создаёт отдельный API-токен `subscription-page`, сохраняет его в `/opt/remnawave/.env` как `REMNAWAVE_API_TOKEN`, пересоздаёт контейнер Subpage и проверяет его состояние. Если токен не получен, установка завершается ошибкой вместо запуска Subpage с пустым токеном.

@@ -1,4 +1,4 @@
-Custom build: remnawave-reverse-proxy 3.0.0-cascade-api-docker-u2404-awg3-v5240
+Custom build: remnawave-reverse 3.0.1
 Target: Ubuntu Server 24.04 x86_64, Linux kernel >= 6.7, KVM/VM
 Date: 2026-08-07
 

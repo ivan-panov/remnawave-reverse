@@ -100,6 +100,10 @@ FRONT_END_DOMAIN=$PANEL_DOMAIN
 ### Review documentation: https://remna.st/docs/install/environment-variables#domains
 SUB_PUBLIC_DOMAIN=$SUB_DOMAIN
 
+### SUBSCRIPTION PAGE API ###
+### Populated automatically after the panel administrator is registered. ###
+REMNAWAVE_API_TOKEN=
+
 ### If CUSTOM_SUB_PREFIX is set in @remnawave/subscription-page, append the same path to SUB_PUBLIC_DOMAIN. Example: SUB_PUBLIC_DOMAIN=sub-page.example.com/sub ###
 
 ### SWAGGER ###
@@ -261,7 +265,7 @@ services:
     environment:
       - REMNAWAVE_PANEL_URL=http://remnawave:3000
       - APP_PORT=3010
-      - REMNAWAVE_API_TOKEN=\$api_token
+      - REMNAWAVE_API_TOKEN=\${REMNAWAVE_API_TOKEN}
       - TRUST_PROXY=1
     ports:
       - '127.0.0.1:3010:3010'
@@ -433,13 +437,16 @@ installation_panel_caddy() {
 
     # Create API token for subscription page
     echo -e "${COLOR_YELLOW}${LANG[CREATING_API_TOKEN]}${COLOR_RESET}"
-    create_api_token "$domain_url" "$token" "$target_dir"
+    if ! create_api_token "$domain_url" "$token" "$target_dir"; then
+        echo -e "${COLOR_RED}${LANG[SUBPAGE_INSTALL_ABORTED]}${COLOR_RESET}"
+        return 1
+    fi
 
-    # Recreate Remnawave Subscription Page after writing the API token.
+    # Recreate Subscription Page with the newly stored token and verify it.
     echo -e "${COLOR_YELLOW}${LANG[STARTING_REMNAWAVE_SUBSCRIPTION_PAGE]}${COLOR_RESET}"
-    sleep 1
-    docker compose up -d --force-recreate remnawave-subscription-page > /dev/null 2>&1 &
-    spinner $! "${LANG[WAITING]}"
+    if ! verify_subscription_page_runtime "$target_dir"; then
+        return 1
+    fi
 
     clear
 

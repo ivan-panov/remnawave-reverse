@@ -297,6 +297,10 @@ In NGINX mode, the generated configuration can protect the Panel behind a secret
 - [AmneziaWG 3.0 integration](./AMNEZIAWG3-REMNAWAVE-RU.md)
 - [Container updates](./CONTAINER-UPDATES-RU.md)
 
+### Automatic Subscription Page setup
+
+During installation, the script waits for the local Panel API, creates a dedicated `subscription-page` API token, stores it in `/opt/remnawave/.env` as `REMNAWAVE_API_TOKEN`, recreates the Subpage container, and verifies its health. If no token is returned, installation stops instead of starting Subpage with an empty token.
+
 ## Security notes
 
 - Keep Panel and node secrets out of logs, screenshots and issue reports.

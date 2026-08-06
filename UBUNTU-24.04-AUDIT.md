@@ -1,6 +1,6 @@
 # Ubuntu 24.04 audit
 
-Build: `3.0.0-cascade-api-docker-u2404-awg3-v5240`  
+Build: `3.0.1`  
 Date: 2026-08-07
 
 ## Scope
