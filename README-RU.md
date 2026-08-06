@@ -1,6 +1,14 @@
+<p align="center"><a href="https://github.com/ivan-panov/remnawave-reverse">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./media/logo.png" />
+    <source media="(prefers-color-scheme: light)" srcset="./media/logo-black.png" />
+    <img alt="Remnawave Reverse" src="./media/logo.png" />
+  </picture>
+</a></p>
+
 <p align="center">
-  <strong>Русский</strong> |
-  <a href="./README.md">English</a>
+  <img src="./media/ru.png" alt="Русский" /> <strong>Русский</strong> |
+  <img src="./media/us.png" alt="English" /> <a href="./README.md">English</a>
 </p>
 
 ---
