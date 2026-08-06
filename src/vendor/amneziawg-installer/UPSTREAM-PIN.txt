@@ -1,0 +1,6 @@
+Repository: https://github.com/bivlked/amneziawg-installer
+Release: v5.24.0
+Commit: 2c86966f59d54c0fd0bcf66639c537558a1a0c25
+Launcher downloads the immutable raw file from this commit over HTTPS.
+Expected result on x86_64 with kernel >= 6.7: AmneziaWG kernel module 3.x.
+Older kernels and some ARM paths are intentionally rejected by the Remnawave integration because they may install module 2.x.

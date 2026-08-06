@@ -1,0 +1,9 @@
+Validation performed before packaging:
+- bash syntax check: install_remnawave.sh
+- bash syntax check: all shell modules and language files under src/
+- JSON builder test: exit VLESS+REALITY inbound and entry VLESS+REALITY outbound
+- selector test: entry/exit node and active inbound selection
+- mocked Remnawave API lifecycle test:
+  create -> disable -> enable -> remove/rollback
+
+Not performed: a live deployment against the user's production Remnawave panel/nodes.

@@ -1,0 +1,71 @@
+Validation report — remnawave-reverse-proxy 3.0.0-cascade-api-docker-u2404-awg3-v5240
+Date: 2026-08-07
+Target: Ubuntu Server 24.04 LTS x86_64, Linux kernel 6.7+, KVM/VM
+
+Scope
+-----
+Menu item 13 was changed from AmneziaWG 2.0 to AmneziaWG 3.0 while preserving the existing Remnawave TPROXY design:
+client -> awg0 -> Xray tunnel inbound -> selected Remnawave outbound.
+
+Upstream pin
+------------
+Repository: bivlked/amneziawg-installer
+Release script: v5.24.0
+Immutable commit: 2c86966f59d54c0fd0bcf66639c537558a1a0c25
+The bundled launcher downloads the main installer and helper scripts from that commit and validates the expected upstream version/structure before execution.
+
+Checks completed successfully
+-----------------------------
+1. bash -n passed for the main installer and all 19 bundled shell files.
+2. No CRLF line endings were found in shell files.
+3. All LANG[...] keys used by the custom AWG/cascade modules exist in both ru.sh and en.sh.
+4. Menu item 13 and its Russian/English labels refer to AmneziaWG 3.0.
+5. Pinned launcher mock test:
+   - forwards all command-line arguments;
+   - pins AWG_BRANCH to the same immutable commit for helper scripts;
+   - rejects an unexpected upstream version/structure.
+6. AWG3 host/version gate mock tests:
+   - x86_64 + Linux 6.8 fresh host accepted;
+   - kernel older than 6.7 rejected;
+   - ARM path rejected by this strict AWG3-only integration;
+   - active module 3.x accepted;
+   - active module 2.x rejected.
+7. Legacy integration safety:
+   - state schema older than version 4 is rejected;
+   - old remnawave-awg2 services/scripts/iptables chain block a new AWG3 creation;
+   - new build does not attempt to mutate or remove old AWG2 state.
+8. Xray profile builder test:
+   - creates AWG3_TPROXY_IN with protocol=tunnel;
+   - allowedNetwork=tcp,udp;
+   - followRedirect=true;
+   - sockopt.tproxy=tproxy;
+   - block/API guards remain before AWG3 rules;
+   - AWG3 rules remain before the previous generic catch-all route.
+9. Generated runtime test:
+   - private chain REMNA_AWG3;
+   - service names remnawave-awg3-*;
+   - generated scripts pass bash -n;
+   - generated systemd units pass systemd-analyze verify;
+   - post-reboot resume enables TPROXY only when modinfo reports 3.x.
+10. State schema was bumped to version 4 and records the detected module version.
+11. Cascade dependency guard was updated to the AWG3 integration.
+12. The installer still copies the complete src tree, including the pinned AWG launcher, into /usr/local/remnawave_reverse.
+
+Important upstream behavior
+---------------------------
+The upstream v5.24.0 installer does not guarantee module 3.0 on every supported host. It chooses 3.0 on x86_64 with Linux 6.7+; older kernels and some ARM/prebuilt paths may receive 2.0. This custom menu item intentionally enforces x86_64 + kernel 6.7+ and verifies the installed module so its label remains truthful.
+
+The upstream installer currently does not enable every experimental AWG 3.0 wire feature in generated client configs. Existing AWG configuration syntax remains compatible, but header protection/content-padding/timing extensions are not automatically enabled by this integration.
+
+Not performed / limitations
+---------------------------
+- No live installation on a real Ubuntu 24.04 KVM VPS.
+- No real PPA/DKMS compilation or Secure Boot test.
+- No two-reboot continuation test on an actual host.
+- No real Remnawave API/node was modified.
+- No end-to-end TCP/UDP/DNS test through AWG3 -> Xray -> VLESS -> exit VPS.
+- shellcheck is not installed in the validation environment.
+
+Operational requirement
+-----------------------
+If the previous AWG2 menu item 13 was already created, remove it cleanly with the previous build first. Do not install AWG3 over the old integration state. Take a VPS snapshot before the first live test.
