@@ -1,207 +1,320 @@
-<p aling="center"><a href="https://github.com/ivan-panov/remnawave-reverse">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="./media/logo.png" />
-   <source media="(prefers-color-scheme: light)" srcset="./media/logo-black.png" />
-   <img alt="Remnawave Reverse Proxy" src="https://github.com/ivan-panov/remnawave-reverse" />
- </picture>
+<p align="center"><a href="https://github.com/ivan-panov/remnawave-reverse">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./media/logo.png" />
+    <source media="(prefers-color-scheme: light)" srcset="./media/logo-black.png" />
+    <img alt="Remnawave Reverse" src="./media/logo.png" />
+  </picture>
 </a></p>
 
 <p align="center">
-  <img src="./media/ru.png" alt="Русский" /> <a href="/README-RU.md">Русский</a> | <img src="./media/us.png" alt="English" /> <strong>English</strong>
+  <img src="./media/ru.png" alt="Русский" /> <a href="./README-RU.md">Русский</a> |
+  <img src="./media/us.png" alt="English" /> <strong>English</strong>
 </p>
 
 ---
 
 > [!CAUTION]
-> **THIS REPOSITORY IS AN EDUCATIONAL EXAMPLE FOR LEARNING NGINX, REVERSE PROXY, AND NETWORK SECURITY BASICS. THIS SCRIPT DEMONSTRATES NGINX SETUP AS A REVERSE PROXY. NOT FOR PRODUCTION AND NOT FOR PRODUCTION USE! IF YOU DON'T UNDERSTAND HOW THE CONTROL PANEL WORKS - THAT'S YOUR PROBLEM, NOT THE SCRIPT AUTHOR'S. USE AT YOUR OWN RISK!**
-
----
+> **This repository is an educational example for learning NGINX/Caddy, reverse proxies, Xray and network security basics. It is not an official Remnawave installer. Review the code, make backups and test on a non-production VPS before use.**
 
 ## Overview
 
-This automation script simplifies the deployment of a reverse proxy server using NGINX and XRAY, as well as the installation of Remnawave control panel and node. The architecture is optimized for performance: Xray runs directly on port 443 and redirects traffic through a Unix socket that NGINX listens to, minimizing TCP overhead and improving connection reliability.
+`remnawave-reverse` automates installation and management of:
 
-> [!IMPORTANT]
-> Debian and Ubuntu support. The script was tested in a KVM virtualization environment. For proper operation, you will need your own domain. It is recommended to run with root privileges on a freshly installed system.
+- Remnawave Panel and Remnawave Node;
+- NGINX or Caddy reverse proxy;
+- Subscription Page and SelfSteal for VLESS REALITY;
+- SSL certificates, UFW, IPv6 and WARP-related helpers;
+- server-side VLESS cascade between Remnawave nodes;
+- AmneziaWG 3.0 ingress redirected into Remnawave/Xray;
+- manual and optional scheduled container updates.
 
-### Deployment Modes
+Xray can listen directly on port 443 and pass web traffic to the reverse proxy through a Unix socket, reducing unnecessary TCP proxying.
 
-The script supports flexible deployment configurations:
+## Current modified-build features
 
-**1. Single Server Mode**
-- Control panel and XRAY node installed on one machine
-- Suitable for compact installations with moderate traffic
+### Docker preflight
 
-**2. Distributed Mode**
-- **Panel Server**: Management center without XRAY node
-- **Node Server**: Hosts XRAY node with SelfSteal stub for VLESS REALITY
+Before installing Remnawave, the script checks:
 
-### Domain Requirements
+- Docker Engine;
+- Docker daemon status;
+- Docker Compose v2;
+- ability to run a test container.
 
-Prepare three domains or subdomains before installation:
+On supported Ubuntu systems, missing or broken Docker components can be installed from Docker's official APT repository before Remnawave setup continues.
 
-1. **Control Panel**: Access to management interface
-2. **Subscription Page**: Client configuration distribution
-3. **SelfSteal Stub**: Camouflage website hosted on node server
+### Current container branches
 
----
+New installations use maintained application branches:
 
-## Domain Setup
-
-The script supports two methods for obtaining SSL certificates:
-- **Cloudflare**: Management through Cloudflare API
-- **ACME**: Direct integration with hosting provider
-
-### DNS Configuration Examples
-
-#### Single Server Installation (panel + node together)
-
-| Record Type | Name              | Value            | Proxy Status |
-|-------------|-------------------|------------------|--------------|
-| A           | example.com       | your_server_ip   | DNS only     |
-| CNAME       | panel.example.com | example.com      | DNS only     |
-| CNAME       | sub.example.com   | example.com      | DNS only     |
-| CNAME       | node.example.com  | example.com      | DNS only     |
-
-> [!TIP]
-> The `node.example.com` record is optional for SelfSteal functionality. You can use the root domain `example.com` instead.
-
-#### Distributed Installation (panel and node on different servers)
-
-| Record Type | Name              | Value                | Proxy Status |
-|-------------|-------------------|----------------------|--------------|
-| A           | example.com       | panel_server_ip      | DNS only     |
-| CNAME       | panel.example.com | example.com          | DNS only     |
-| CNAME       | sub.example.com   | example.com          | DNS only     |
-| A           | node.example.com  | node_server_ip       | DNS only     |
-
----
-
-## Installation Guide
-
-### Single Server Deployment
-
-1. Run the installation script
-2. Select **"Install Remnawave Components"**
-3. Select **"Install panel and node on one server"**
-4. Wait for completion
-5. The script will automatically restart services and display login credentials
-
-### Distributed Deployment
-
-**Step 1: Panel Server Setup**
-
-1. Run the installation script on the first server
-2. Select **"Install Remnawave Components"**
-3. Select **"Install panel only"**
-4. Save the provided credentials
-
-**Step 2: Certificate Export**
-
-1. Log in to the control panel
-2. Navigate to **Nodes** → **Management**
-3. Select the target node
-4. Find the **"Secret Key (SECRET_KEY)"** field
-5. Copy the certificate using the copy icon
-
-**Step 3: Node Server Setup**
-
-1. Run the installation script on the second server
-2. Select **"Install Remnawave Components"**
-3. Select **"Install node only"**
-4. Paste the certificate when prompted
-5. Confirm the successful node connection message
-
----
-
-## Security Features
-
-### Panel Access Protection
-
-NGINX configuration implements URL parameter-based authentication to protect against unauthorized discovery:
-
-**Access Method**
-```
-https://panel.example.com/auth/login?<SECRET_KEY>=<SECRET_KEY>
+```yaml
+remnawave/backend:3
+remnawave/subscription-page:latest
+remnawave/node:latest
+nginx:stable        # NGINX mode
+caddy:2             # Caddy mode
+valkey/valkey:9-alpine
 ```
 
-**How It Works**
+PostgreSQL remains pinned in the generated Compose file. Database major-version upgrades must not be performed as an unattended container update.
 
-1. URL parameter automatically sets a cookie in the browser
-   - Cookie name: `<SECRET_KEY>`
-   - Cookie value: `<SECRET_KEY>`
+### VLESS server-side cascade
 
-2. Access requirements:
-   - Valid cookie must be present
-   - URL must contain correct parameter
+Menu item **12** creates and manages this route through the Remnawave API:
 
-3. Failed access behavior:
-   - Missing cookie: Blank page or 404 error
-   - Incorrect parameter: Blank page or 404 error
+```text
+Client → public VLESS inbound on entry node
+       → VLESS + REALITY outbound
+       → bridge VLESS inbound on exit node
+       → direct Internet access from exit node
+```
 
-This protection level prevents:
-- Host scanning discovery
-- Path brute-force attacks
-- Brute-force access attempts
+The automation clones both Config Profiles, creates a service Internal Squad and user, assigns the profiles, restarts nodes and saves rollback data. It supports:
 
-The panel remains invisible without the correct authentication parameter.
+- all selected inbound traffic through the exit node;
+- Russian destinations directly through the entry node and other traffic through the exit node;
+- status checks;
+- disable/enable;
+- full removal with restoration of original profiles.
 
----
+See [CASCADE-VLESS-RU.md](./CASCADE-VLESS-RU.md).
 
-## Features
+### AmneziaWG 3.0 ingress
 
-### Proxy Server Configuration
-- Automatic configuration updates via subscription
-- JSON subscription support with format conversion for popular clients
-- Compatibility with major proxy clients
+Menu item **13** integrates AmneziaWG traffic with a selected Remnawave outbound:
 
-### NGINX Integration
-- Optimized reverse proxy setup with XRAY
-- Unix socket communication for reduced overhead
+```text
+AmneziaWG client → awg0 on the local VPS
+                 → transparent TCP/UDP interception
+                 → Remnawave Node / Xray
+                 → selected outbound, including VLESS cascade
+```
 
-### Security Implementation
-- **Firewall**: UFW configuration for access control
-- **SSL Certificates**: Cloudflare or ACME with automatic renewal
-- **IPv6 Management**: Vulnerability prevention measures
-- **TCP Optimization**: BBR congestion control algorithm
-- **Masking**: Random website template selection
+The bundled integration uses the `bivlked/amneziawg-installer` v5.24.0 source pinned by the custom build. Guaranteed AWG 3.0 installation requires a compatible x86_64 host and Linux kernel 6.7 or newer; the module blocks a silent fallback to AWG 2.0.
 
----
+See [AMNEZIAWG3-REMNAWAVE-RU.md](./AMNEZIAWG3-REMNAWAVE-RU.md).
 
-## Quick Start
+### Container updates
 
-Execute the following command to begin installation:
+The management module can:
+
+- show configured images and container health;
+- create a pre-update backup;
+- migrate an existing Panel 2 Compose configuration to Panel 3 after confirmation;
+- run `docker compose pull` and recreate services;
+- enable or disable a weekly systemd update timer;
+- log update results.
+
+See [CONTAINER-UPDATES-RU.md](./CONTAINER-UPDATES-RU.md).
+
+## Supported deployment modes
+
+### 1. Panel and node on one VPS
+
+Suitable for testing or small installations. The script displays a warning because separate Panel and Node hosts are preferred for production-like deployments.
+
+### 2. Distributed deployment
+
+- **Panel VPS:** Remnawave Panel, database, cache, Subscription Page and reverse proxy.
+- **Entry Node VPS:** client-facing Remnawave Node.
+- **Exit Node VPS:** optional exit node for the VLESS cascade.
+
+The cascade module must be run on the Panel VPS after both nodes are connected and have active Config Profiles.
+
+## Requirements
+
+- root access;
+- a clean Debian or Ubuntu VPS; Ubuntu 24.04 is the primary tested target for the custom automation;
+- KVM or another virtualization type that supports the required kernel/network features;
+- Docker Engine and Docker Compose v2, or permission for the script to install them on Ubuntu;
+- your own domains with DNS records already pointing to the required VPS addresses;
+- enough CPU, RAM and disk for the selected Panel/Node layout;
+- a snapshot or external backup before major updates and routing changes.
+
+For AmneziaWG 3.0 integration, also check:
+
+```bash
+uname -m
+uname -r
+```
+
+The strict AWG 3.0 path expects `x86_64` and Linux kernel `6.7+`.
+
+## Domain requirements
+
+Prepare up to three domains or subdomains:
+
+1. **Panel domain** — management UI.
+2. **Subscription domain** — client subscription page.
+3. **SelfSteal domain** — camouflage site for the node.
+
+### Single-server DNS example
+
+| Type  | Name              | Value          | Proxy |
+|-------|-------------------|----------------|-------|
+| A     | example.com       | server IP      | DNS only |
+| CNAME | panel.example.com | example.com    | DNS only |
+| CNAME | sub.example.com   | example.com    | DNS only |
+| CNAME | node.example.com  | example.com    | DNS only |
+
+### Distributed DNS example
+
+| Type  | Name              | Value          | Proxy |
+|-------|-------------------|----------------|-------|
+| A     | example.com       | Panel VPS IP   | DNS only |
+| CNAME | panel.example.com | example.com    | DNS only |
+| CNAME | sub.example.com   | example.com    | DNS only |
+| A     | node.example.com  | Node VPS IP    | DNS only |
+
+## Quick start
+
+Run the current installer from this repository:
+
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ivan-panov/remnawave-reverse/refs/heads/main/install_remnawave.sh)
 ```
 
-<p align="center">
-  <img src="./media/remnawave-reverse-proxy_en.png" alt="Installation Interface" />
-</p>
+For a locally downloaded archive:
+
+```bash
+cd /root
+unzip -o remnawave-reverse*.zip -d /root/
+cd /root/remnawave-reverse*
+chmod +x install_remnawave.sh
+./install_remnawave.sh
+```
+
+> [!IMPORTANT]
+> Do not use a wildcard `cd` command when more than one matching directory exists. In that case, enter the exact extracted directory name.
+
+## Installation flow
+
+### Panel-only deployment
+
+1. Run the installer on the Panel VPS.
+2. Select **Install Remnawave Components**.
+3. Select **Install only the panel**.
+4. Choose NGINX or Caddy.
+5. Enter the Panel and Subscription domains and certificate details.
+6. Save the generated panel access URL and credentials.
+
+### Node-only deployment
+
+1. Create the node in Remnawave Panel.
+2. Copy its secret key/certificate from **Nodes → Management**.
+3. Run the installer on the Node VPS.
+4. Select **Install Remnawave Components**.
+5. Select **Install only the node**.
+6. Enter the Panel address, node secret and SelfSteal domain when prompted.
+7. Verify that the node is connected in the Panel.
+
+### Single-server deployment
+
+1. Run the installer.
+2. Select **Install Remnawave Components**.
+3. Select **Install panel and node on one server**.
+4. Confirm the warning.
+5. Choose NGINX or Caddy and complete the prompts.
+
+## Creating the VLESS cascade
+
+Before starting:
+
+- both entry and exit nodes must be online;
+- each node must have an active Config Profile;
+- the exit-node bridge TCP port must be allowed by its firewall;
+- run the menu on the Panel VPS.
+
+Open the menu:
+
+```bash
+rr
+```
+
+Then select:
+
+```text
+12. Server routing — VLESS IN → VLESS OUT cascade
+1. Create cascade automatically
+```
+
+Choose the entry node, exit node, entry inbound(s), REALITY parameters and routing mode. After creation, use the same submenu to check status or perform rollback.
+
+## Creating AmneziaWG 3.0 ingress
+
+Run this on the VPS that hosts the local `awg0` interface and the selected Remnawave Node:
+
+```bash
+rr
+```
+
+Then select:
+
+```text
+13. AmneziaWG 3.0 — traffic ingress to Remnawave
+1. Create integration automatically
+```
+
+The module can install AWG, continue after required reboots, create the transparent Xray inbound, add policy-routing rules and select an existing Remnawave outbound.
+
+Do not mix an old AWG 2.0 integration with the AWG 3.0 module. Remove the legacy integration using its original build first.
+
+## Container management and updates
+
+Open:
+
+```bash
+rr
+```
+
+Select **Manage panel/node**. Available actions include start, stop, update, logs, CLI, panel access, container versions and scheduled updates.
+
+Useful manual checks:
+
+```bash
+docker ps
+docker compose version
+cd /opt/remnawave && docker compose config -q
+cd /opt/remnawave && docker compose images
+```
+
+For a node-only host:
+
+```bash
+cd /opt/remnanode && docker compose config -q
+```
+
+## Panel access protection
+
+In NGINX mode, the generated configuration can protect the Panel behind a secret URL parameter/cookie. Save the exact access URL shown after installation. Without the correct parameter or cookie, the Panel may return a blank response or 404.
+
+## Documentation
+
+- [Russian installation notes for this repository](./INSTALL-IVAN-RU.md)
+- [Docker and API automation](./DOCKER-API-AUTOMATION-RU.md)
+- [Ubuntu 24.04 audit](./UBUNTU-24.04-AUDIT.md)
+- [VLESS cascade](./CASCADE-VLESS-RU.md)
+- [AmneziaWG 3.0 integration](./AMNEZIAWG3-REMNAWAVE-RU.md)
+- [Container updates](./CONTAINER-UPDATES-RU.md)
+
+## Security notes
+
+- Keep Panel and node secrets out of logs, screenshots and issue reports.
+- Do not expose PostgreSQL, Valkey or internal Panel API ports publicly.
+- Restrict the cascade bridge port to the entry VPS IP whenever possible.
+- Review UFW rules after installing additional protocols.
+- Keep backups outside the VPS.
+- Treat unattended application updates and database major upgrades differently.
 
 ---
 
 > [!CAUTION]
-> **This repository is intended solely for educational purposes and for studying the principles of reverse proxy servers and network security. The script demonstrates proxy server configuration using NGINX for reverse proxy, traffic management, and attack protection.**
->
-> **We strongly remind you that using this tool to bypass network blocks or censorship is illegal in a number of countries where laws exist regulating the use of technologies to circumvent internet restrictions.**
->
-> **This project is not intended for use in ways that violate information protection laws or interfere with censorship mechanisms. We are not responsible for any legal consequences associated with using this script.**
->
-> **Use this tool/script solely for demonstration purposes, as an example of reverse proxy operation and data protection. We strongly recommend deleting the script after familiarization. Further use is at your own risk.**
->
-> **If you are unsure whether using this tool or its components violates the laws of your country - refrain from any interaction with this tool.**
+> Use this project only where permitted by applicable law and your network/provider terms. The maintainers are not responsible for data loss, downtime, misconfiguration or legal consequences.
 
 ## Community
 
-Join our Telegram community for support and discussions:
-
-**Telegram chat**: [https://t.me/remnawave_reverse](https://t.me/remnawave_reverse)
+Telegram chat: [https://t.me/remnawave_reverse](https://t.me/remnawave_reverse)
 
 ## Donations
-
-If you like this project and want to support its further development, please consider making a donation. Your contribution helps fund future updates and improvements!
-
-**Donation Methods:**
 
 - **TON USDT:** `UQAxyZDwKUPQ5Bp09JOFcaDVakjYQT46rf3iP3lnl_qc9xVS`
