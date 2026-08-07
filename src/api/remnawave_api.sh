@@ -507,7 +507,9 @@ create_api_token() {
     local token_name="${4:-subscription-page}"
     local max_attempts="${5:-12}"
     local retry_delay="${6:-5}"
-    local attempt response body http_code api_token token_data request_name
+    local attempt body http_code api_token token_data request_name
+    local curl_rc curl_error body_file error_file api_message
+    local backend_state backend_health backend_restarts backend_oom
 
     [ -n "$token" ] || {
         echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}: admin JWT is empty${COLOR_RESET}" >&2
@@ -518,28 +520,46 @@ create_api_token() {
         return 1
     }
 
+    # The Subpage starts with an intentionally empty token in a fresh install.
+    # Stop it while the token is being created: this avoids an unhealthy retry
+    # loop and reduces RAM pressure on small VPS instances.
+    (
+        cd "$target_dir" || exit 0
+        docker compose stop remnawave-subscription-page >/dev/null 2>&1 || true
+    )
+
     request_name="$token_name"
 
     for ((attempt=1; attempt<=max_attempts; attempt++)); do
-        token_data=$(jq -nc --arg tokenName "$request_name" '{tokenName:$tokenName}') || return 1
+        # Remnawave Panel v3 expects name/expiresInDays/scopes.  The previous
+        # tokenName-only payload belongs to an older API contract and can make
+        # current backends close the request without returning an HTTP body.
+        token_data=$(jq -nc --arg name "$request_name" \
+            '{name:$name,expiresInDays:365,scopes:["*"]}') || return 1
 
-        response=$(curl -sS --connect-timeout 5 --max-time 30 \
+        body_file=$(mktemp) || return 1
+        error_file=$(mktemp) || {
+            rm -f "$body_file"
+            return 1
+        }
+
+        http_code=$(curl -sS --http1.1 --connect-timeout 5 --max-time 30 \
+            -o "$body_file" \
+            -w '%{http_code}' \
             -X POST "http://$domain_url/api/tokens" \
             -H "Authorization: Bearer $token" \
             -H 'Content-Type: application/json' \
+            -H 'X-Forwarded-For: 127.0.0.1' \
+            -H 'X-Forwarded-Proto: https' \
             -H 'X-Remnawave-Client-Type: browser' \
-            -d "$token_data" \
-            -w $'\n%{http_code}') || response=""
+            -d "$token_data" 2>"$error_file")
+        curl_rc=$?
+        body=$(cat "$body_file" 2>/dev/null || true)
+        curl_error=$(cat "$error_file" 2>/dev/null || true)
+        rm -f "$body_file" "$error_file"
 
-        if [[ "$response" == *$'\n'* ]]; then
-            http_code="${response##*$'\n'}"
-            body="${response%$'\n'*}"
-        else
-            http_code="000"
-            body="$response"
-        fi
-
-        if [[ "$http_code" =~ ^20[01]$ ]] && printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+        if [ "$curl_rc" -eq 0 ] && [[ "$http_code" =~ ^20[01]$ ]] && \
+           printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
             api_token=$(printf '%s' "$body" | jq -r '
                 (.response.token //
                  .response.apiToken //
@@ -565,31 +585,58 @@ create_api_token() {
                     unset api_token
                     return 1
                 }
-                unset api_token body response
+                unset api_token body
                 echo -e "${COLOR_GREEN}${LANG[API_TOKEN_ADDED]}${COLOR_RESET}" >&2
                 return 0
             fi
         fi
 
-        # A previous interrupted installation may already have created this name.
-        # API tokens are shown only once, so retry with a unique name instead of
-        # trying to reuse an unrecoverable secret.
+        # A previous interrupted installation may already have created this
+        # name. API token values are displayed only once, therefore create a
+        # new uniquely named token instead of trying to reuse an unknown value.
         if [ "$http_code" = "409" ]; then
             request_name="${token_name}-$(date +%Y%m%d%H%M%S)-${attempt}"
         fi
 
+        # Authentication errors are permanent; retrying the same JWT is useless.
+        if [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+            break
+        fi
+
         if [ "$attempt" -lt "$max_attempts" ]; then
-            echo -e "${COLOR_YELLOW}${LANG[API_TOKEN_RETRY]} ${attempt}/${max_attempts} (HTTP ${http_code})${COLOR_RESET}" >&2
+            if [ "$curl_rc" -ne 0 ]; then
+                backend_state=$(docker inspect -f '{{.State.Status}}' remnawave 2>/dev/null || echo unknown)
+                backend_health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' remnawave 2>/dev/null || echo unknown)
+                backend_restarts=$(docker inspect -f '{{.RestartCount}}' remnawave 2>/dev/null || echo unknown)
+                backend_oom=$(docker inspect -f '{{.State.OOMKilled}}' remnawave 2>/dev/null || echo unknown)
+                echo -e "${COLOR_YELLOW}${LANG[API_TOKEN_RETRY]} ${attempt}/${max_attempts} (curl ${curl_rc}, HTTP 000; backend=${backend_state}/${backend_health}, restarts=${backend_restarts}, oom=${backend_oom})${COLOR_RESET}" >&2
+                [ -n "$curl_error" ] && echo "curl: $curl_error" >&2
+            else
+                echo -e "${COLOR_YELLOW}${LANG[API_TOKEN_RETRY]} ${attempt}/${max_attempts} (HTTP ${http_code})${COLOR_RESET}" >&2
+                if printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+                    api_message=$(printf '%s' "$body" | jq -r '.message // .error // .errorCode // empty' 2>/dev/null)
+                    [ -n "$api_message" ] && echo "API: $api_message" >&2
+                fi
+            fi
             sleep "$retry_delay"
         fi
     done
 
-    local api_message=""
-    if printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+    api_message=""
+    if [ "$curl_rc" -ne 0 ]; then
+        api_message="curl ${curl_rc}: ${curl_error:-empty reply from server}"
+    elif printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
         api_message=$(printf '%s' "$body" | jq -r '.message // .error // .errorCode // empty' 2>/dev/null)
     fi
-    [ -n "$api_message" ] || api_message="HTTP ${http_code}"
+    [ -n "$api_message" ] || api_message="HTTP ${http_code:-000}"
     echo -e "${COLOR_RED}${LANG[ERROR_CREATE_API_TOKEN]}: ${api_message}${COLOR_RESET}" >&2
+
+    # Preserve the relevant diagnostics in the installer output. Secrets are
+    # not logged.
+    docker inspect remnawave \
+        --format 'backend: status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} restarts={{.RestartCount}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}' \
+        >&2 2>/dev/null || true
+    docker logs --tail=80 remnawave >&2 2>/dev/null || true
     return 1
 }
 
