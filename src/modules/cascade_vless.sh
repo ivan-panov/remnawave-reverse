@@ -506,7 +506,7 @@ create_vless_cascade() {
     }
 
     local exit_clone_name
-    exit_clone_name="Cascade Exit - ${exit_name} - ${stamp}"
+    exit_clone_name="CascadeExit-${stamp}"
     local exit_create_response exit_new_profile_uuid bridge_inbound_uuid exit_new_inbounds
     exit_create_response=$(cascade_create_profile "$exit_clone_name" "$exit_config")
     if ! cascade_response_ok "$exit_create_response"; then
@@ -579,7 +579,7 @@ create_vless_cascade() {
     }
 
     local entry_clone_name entry_create_response entry_new_inbounds
-    entry_clone_name="Cascade Entry - ${entry_name} - ${stamp}"
+    entry_clone_name="CascadeEntry-${stamp}"
     entry_create_response=$(cascade_create_profile "$entry_clone_name" "$entry_config")
     if ! cascade_response_ok "$entry_create_response"; then
         cascade_error "${LANG[CASCADE_ENTRY_PROFILE_CREATE_ERROR]}: $entry_create_response"

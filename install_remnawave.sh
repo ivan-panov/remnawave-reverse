@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="3.0.6"
+SCRIPT_VERSION="3.0.7"
 CUSTOM_BUILD=false
 
 # Repository used for installation and self-updates. It can be overridden for
