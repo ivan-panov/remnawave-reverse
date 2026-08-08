@@ -1,3 +1,15 @@
+# 3.0.10
+
+- Проведён полный статический аудит актуального архива 3.0.9.
+- VLESS-каскад больше не клонирует активные Config Profile: новые установки обновляют два разных профиля на месте и сохраняют полный JSON/active inbound tags для отката. Это устраняет конфликт глобально уникальных inbound-тегов Remnawave.
+- Добавлен безопасный rollback для in-place каскада и совместимость со старыми state v2.
+- Самообновление теперь обновляет полный набор runtime-файлов, включая отсутствующие модули, оба языка, tools и vendor launcher, и проверяет каждый shell-файл через `bash -n` до замены.
+- Исправлен неполный rollback ремонта standalone Nginx: Certbot renew hook меняется только после успешной live-проверки контейнера.
+- Удалены дубли функции/локализационного ключа и лишнее повторное добавление выбранного inbound в cascade-модуле.
+- Исправлены ещё 21 PNG-файл с ошибочным расширением `.webp`; теперь все WebP имеют корректный RIFF/WebP формат.
+- Workflow документации обновлён на Node 24-совместимые Actions (`checkout@v7`, `withastro/action@v6`, `deploy-pages@v5`).
+- Из релизного архива удалены старые validation/build/hotfix отчёты и настройки VS Code.
+
 # 3.0.9
 
 - Standalone Nginx Node now mounts `/etc/letsencrypt` read-only as a complete tree, so Certbot `live -> archive` symlinks remain valid inside the container and after renewals.

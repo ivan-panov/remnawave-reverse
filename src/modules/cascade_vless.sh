@@ -96,12 +96,87 @@ cascade_get_profile() {
     cascade_api GET "/api/config-profiles/$1"
 }
 
-cascade_create_profile() {
-    local name="$1"
-    local config="$2"
-    local payload
-    payload=$(jq -n --arg name "$name" --argjson config "$config" '{name:$name, config:$config}') || return 1
-    cascade_api POST "/api/config-profiles" "$payload"
+# Remnawave requires inbound tags to be globally unique, therefore copying an
+# active profile can fail even when the clone name itself is valid.  New cascade
+# installations update the two selected profiles in place and keep full snapshots
+# for rollback.  Support both profile-update API forms used by Panel 3.x builds.
+cascade_update_profile() {
+    local uuid="$1"
+    local name="$2"
+    local config="$3"
+    local payload response payload_by_uuid response_by_uuid
+
+    payload=$(jq -n \
+        --arg uuid "$uuid" \
+        --arg name "$name" \
+        --argjson config "$config" \
+        '{uuid:$uuid,name:$name,config:$config}') || return 1
+    response=$(cascade_api PATCH "/api/config-profiles" "$payload")
+    if cascade_response_ok "$response"; then
+        printf '%s' "$response"
+        return 0
+    fi
+
+    payload_by_uuid=$(jq -n \
+        --arg name "$name" \
+        --argjson config "$config" \
+        '{name:$name,config:$config}') || return 1
+    response_by_uuid=$(cascade_api PATCH "/api/config-profiles/$uuid" "$payload_by_uuid")
+    if cascade_response_ok "$response_by_uuid"; then
+        printf '%s' "$response_by_uuid"
+        return 0
+    fi
+
+    printf '%s' "${response_by_uuid:-$response}"
+    return 1
+}
+
+cascade_restore_profile_snapshot() {
+    local node_uuid="$1"
+    local profile_uuid="$2"
+    local profile_name="$3"
+    local config="$4"
+    local active_tags="$5"
+    local response profile_response active_inbounds
+
+    response=$(cascade_update_profile "$profile_uuid" "$profile_name" "$config") || return 1
+    profile_response=$(cascade_get_profile "$profile_uuid")
+    cascade_response_ok "$profile_response" || return 1
+    active_inbounds=$(cascade_map_active_tags "$profile_response" "$active_tags")
+    jq -e 'type == "array"' >/dev/null 2>&1 <<< "$active_inbounds" || return 1
+    cascade_assign_profile "$node_uuid" "$profile_uuid" "$active_inbounds"
+}
+
+cascade_apply_profile_snapshot() {
+    local node_uuid="$1"
+    local profile_uuid="$2"
+    local profile_name="$3"
+    local config="$4"
+    local active_tags="$5"
+    local extra_tag="${6:-}"
+    local response profile_response active_inbounds extra_uuid
+
+    response=$(cascade_update_profile "$profile_uuid" "$profile_name" "$config") || {
+        [ -n "$response" ] && cascade_error "$response"
+        return 1
+    }
+    profile_response=$(cascade_get_profile "$profile_uuid")
+    cascade_response_ok "$profile_response" || return 1
+    active_inbounds=$(cascade_map_active_tags "$profile_response" "$active_tags")
+    jq -e 'type == "array"' >/dev/null 2>&1 <<< "$active_inbounds" || return 1
+
+    if [ -n "$extra_tag" ]; then
+        extra_uuid=$(echo "$profile_response" | jq -r --arg tag "$extra_tag" '.response.inbounds[]? | select(.tag == $tag) | .uuid' | head -n1)
+        [ -n "$extra_uuid" ] || return 1
+        active_inbounds=$(jq -c --arg uuid "$extra_uuid" '. + [$uuid] | map(select(length > 0)) | unique' <<< "$active_inbounds")
+        CASCADE_APPLIED_EXTRA_UUID="$extra_uuid"
+    else
+        CASCADE_APPLIED_EXTRA_UUID=""
+    fi
+
+    cascade_assign_profile "$node_uuid" "$profile_uuid" "$active_inbounds" || return 1
+    CASCADE_APPLIED_ACTIVE_INBOUNDS="$active_inbounds"
+    CASCADE_APPLIED_PROFILE_RESPONSE="$profile_response"
 }
 
 cascade_assign_profile() {
@@ -389,6 +464,37 @@ cascade_partial_cleanup() {
     [ -n "$exit_profile_uuid" ] && cascade_delete_resource "/api/config-profiles/$exit_profile_uuid" >/dev/null 2>&1 || true
 }
 
+cascade_partial_cleanup_in_place() {
+    local entry_modified="$1"
+    local exit_modified="$2"
+    local entry_node_uuid="$3"
+    local entry_profile_uuid="$4"
+    local entry_profile_name="$5"
+    local entry_original_config="$6"
+    local entry_original_tags="$7"
+    local exit_node_uuid="$8"
+    local exit_profile_uuid="$9"
+    local exit_profile_name="${10}"
+    local exit_original_config="${11}"
+    local exit_original_tags="${12}"
+    local service_user_uuid="${13}"
+    local squad_uuid="${14}"
+
+    cascade_warn "${LANG[CASCADE_ROLLBACK]}"
+
+    [ -n "$service_user_uuid" ] && cascade_delete_resource "/api/users/$service_user_uuid" >/dev/null 2>&1 || true
+    [ -n "$squad_uuid" ] && cascade_delete_resource "/api/internal-squads/$squad_uuid" >/dev/null 2>&1 || true
+
+    if [ "$entry_modified" = "true" ]; then
+        cascade_restore_profile_snapshot "$entry_node_uuid" "$entry_profile_uuid" "$entry_profile_name" "$entry_original_config" "$entry_original_tags" >/dev/null 2>&1 || true
+        cascade_restart_node "$entry_node_uuid" >/dev/null 2>&1 || true
+    fi
+    if [ "$exit_modified" = "true" ]; then
+        cascade_restore_profile_snapshot "$exit_node_uuid" "$exit_profile_uuid" "$exit_profile_name" "$exit_original_config" "$exit_original_tags" >/dev/null 2>&1 || true
+        cascade_restart_node "$exit_node_uuid" >/dev/null 2>&1 || true
+    fi
+}
+
 create_vless_cascade() {
     cascade_requirements || return 1
 
@@ -423,11 +529,15 @@ create_vless_cascade() {
     cascade_response_ok "$entry_node_response" || { cascade_error "${LANG[CASCADE_NODE_READ_ERROR]}"; return 1; }
     cascade_response_ok "$exit_node_response" || { cascade_error "${LANG[CASCADE_NODE_READ_ERROR]}"; return 1; }
 
-    local entry_profile_uuid exit_profile_uuid_original
+    local entry_profile_uuid exit_profile_uuid
     entry_profile_uuid=$(echo "$entry_node_response" | jq -r '.response.configProfile.activeConfigProfileUuid // empty')
-    exit_profile_uuid_original=$(echo "$exit_node_response" | jq -r '.response.configProfile.activeConfigProfileUuid // empty')
-    if [ -z "$entry_profile_uuid" ] || [ -z "$exit_profile_uuid_original" ]; then
+    exit_profile_uuid=$(echo "$exit_node_response" | jq -r '.response.configProfile.activeConfigProfileUuid // empty')
+    if [ -z "$entry_profile_uuid" ] || [ -z "$exit_profile_uuid" ]; then
         cascade_error "${LANG[CASCADE_PROFILE_REQUIRED]}"
+        return 1
+    fi
+    if [ "$entry_profile_uuid" = "$exit_profile_uuid" ]; then
+        cascade_error "${LANG[CASCADE_SHARED_PROFILE_ERROR]}"
         return 1
     fi
 
@@ -466,15 +576,17 @@ create_vless_cascade() {
         *) routing_mode="all" ;;
     esac
 
-    local entry_profile_response exit_profile_response_original
+    local entry_profile_response exit_profile_response
     entry_profile_response=$(cascade_get_profile "$entry_profile_uuid")
-    exit_profile_response_original=$(cascade_get_profile "$exit_profile_uuid_original")
+    exit_profile_response=$(cascade_get_profile "$exit_profile_uuid")
     cascade_response_ok "$entry_profile_response" || { cascade_error "${LANG[CASCADE_PROFILE_READ_ERROR]}"; return 1; }
-    cascade_response_ok "$exit_profile_response_original" || { cascade_error "${LANG[CASCADE_PROFILE_READ_ERROR]}"; return 1; }
+    cascade_response_ok "$exit_profile_response" || { cascade_error "${LANG[CASCADE_PROFILE_READ_ERROR]}"; return 1; }
 
-    local entry_original_config exit_original_config
+    local entry_profile_name exit_profile_name entry_original_config exit_original_config
+    entry_profile_name=$(echo "$entry_profile_response" | jq -r '.response.name // "Profile"')
+    exit_profile_name=$(echo "$exit_profile_response" | jq -r '.response.name // "Profile"')
     entry_original_config=$(echo "$entry_profile_response" | jq -c '.response.config')
-    exit_original_config=$(echo "$exit_profile_response_original" | jq -c '.response.config')
+    exit_original_config=$(echo "$exit_profile_response" | jq -c '.response.config')
 
     if echo "$exit_original_config" | jq -e --argjson port "$bridge_port" '.inbounds[]? | select(.port == $port)' >/dev/null; then
         cascade_error "$(printf "${LANG[CASCADE_PORT_IN_USE]}" "$bridge_port")"
@@ -500,38 +612,21 @@ create_vless_cascade() {
     original_entry_tags=$(echo "$entry_node_response" | jq -c '[.response.configProfile.activeInbounds[]?.tag]')
     original_exit_tags=$(echo "$exit_node_response" | jq -c '[.response.configProfile.activeInbounds[]?.tag]')
 
-    local exit_config
+    local exit_config entry_config
     exit_config=$(cascade_build_exit_config "$exit_original_config" "$bridge_tag" "$bridge_port" "$private_key" "$short_id" "$reality_target" "$reality_sni") || {
         cascade_error "${LANG[CASCADE_CONFIG_BUILD_ERROR]}"; return 1;
     }
 
-    local exit_clone_name
-    exit_clone_name="CascadeExit-${stamp}"
-    local exit_create_response exit_new_profile_uuid bridge_inbound_uuid exit_new_inbounds
-    exit_create_response=$(cascade_create_profile "$exit_clone_name" "$exit_config")
-    if ! cascade_response_ok "$exit_create_response"; then
-        cascade_error "${LANG[CASCADE_EXIT_PROFILE_CREATE_ERROR]}: $exit_create_response"
-        return 1
-    fi
-    exit_new_profile_uuid=$(echo "$exit_create_response" | jq -r '.response.uuid // empty')
-    bridge_inbound_uuid=$(echo "$exit_create_response" | jq -r --arg tag "$bridge_tag" '.response.inbounds[]? | select(.tag == $tag) | .uuid' | head -n1)
-    exit_new_inbounds=$(cascade_map_active_tags "$exit_create_response" "$original_exit_tags")
-    if [ -z "$exit_new_profile_uuid" ] || [ -z "$bridge_inbound_uuid" ] || ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$exit_new_inbounds"; then
-        cascade_error "${LANG[CASCADE_RESOURCE_ID_ERROR]}"
-        [ -n "$exit_new_profile_uuid" ] && cascade_delete_resource "/api/config-profiles/$exit_new_profile_uuid" >/dev/null 2>&1 || true
-        return 1
-    fi
-    exit_new_inbounds=$(jq -c --arg bridge "$bridge_inbound_uuid" '. + [$bridge] | map(select(length > 0)) | unique' <<< "$exit_new_inbounds")
+    local exit_modified=false entry_modified=false
+    local squad_uuid="" service_user_uuid="" service_vless_uuid="" bridge_inbound_uuid=""
 
-    local exit_assigned=false entry_assigned=false
-    local squad_uuid="" service_user_uuid="" service_vless_uuid="" entry_new_profile_uuid=""
-
-    if ! cascade_assign_profile "$exit_node_uuid" "$exit_new_profile_uuid" "$exit_new_inbounds"; then
-        cascade_error "${LANG[CASCADE_EXIT_ASSIGN_ERROR]}"
-        cascade_partial_cleanup "$entry_node_uuid" "$entry_profile_uuid" "$original_entry_inbounds" "$exit_node_uuid" "$exit_profile_uuid_original" "$original_exit_inbounds" "$entry_assigned" "$exit_assigned" "$entry_new_profile_uuid" "$exit_new_profile_uuid" "$service_user_uuid" "$squad_uuid"
+    if ! cascade_apply_profile_snapshot "$exit_node_uuid" "$exit_profile_uuid" "$exit_profile_name" "$exit_config" "$original_exit_tags" "$bridge_tag"; then
+        cascade_error "${LANG[CASCADE_EXIT_PROFILE_UPDATE_ERROR]}"
+        cascade_restore_profile_snapshot "$exit_node_uuid" "$exit_profile_uuid" "$exit_profile_name" "$exit_original_config" "$original_exit_tags" >/dev/null 2>&1 || true
         return 1
     fi
-    exit_assigned=true
+    exit_modified=true
+    bridge_inbound_uuid="$CASCADE_APPLIED_EXTRA_UUID"
 
     local squad_name squad_payload squad_response
     squad_name="Cascade Bridge ${stamp}"
@@ -539,15 +634,15 @@ create_vless_cascade() {
     squad_response=$(cascade_api POST "/api/internal-squads" "$squad_payload")
     if ! cascade_response_ok "$squad_response"; then
         cascade_error "${LANG[CASCADE_SQUAD_CREATE_ERROR]}: $squad_response"
-        cascade_partial_cleanup "$entry_node_uuid" "$entry_profile_uuid" "$original_entry_inbounds" "$exit_node_uuid" "$exit_profile_uuid_original" "$original_exit_inbounds" "$entry_assigned" "$exit_assigned" "$entry_new_profile_uuid" "$exit_new_profile_uuid" "$service_user_uuid" "$squad_uuid"
+        cascade_partial_cleanup_in_place "$entry_modified" "$exit_modified" "$entry_node_uuid" "$entry_profile_uuid" "$entry_profile_name" "$entry_original_config" "$original_entry_tags" "$exit_node_uuid" "$exit_profile_uuid" "$exit_profile_name" "$exit_original_config" "$original_exit_tags" "$service_user_uuid" "$squad_uuid"
         return 1
     fi
     squad_uuid=$(echo "$squad_response" | jq -r '.response.uuid // empty')
-    if [ -z "$squad_uuid" ]; then
+    [ -n "$squad_uuid" ] || {
         cascade_error "${LANG[CASCADE_RESOURCE_ID_ERROR]}"
-        cascade_partial_cleanup "$entry_node_uuid" "$entry_profile_uuid" "$original_entry_inbounds" "$exit_node_uuid" "$exit_profile_uuid_original" "$original_exit_inbounds" "$entry_assigned" "$exit_assigned" "$entry_new_profile_uuid" "$exit_new_profile_uuid" "$service_user_uuid" "$squad_uuid"
+        cascade_partial_cleanup_in_place "$entry_modified" "$exit_modified" "$entry_node_uuid" "$entry_profile_uuid" "$entry_profile_name" "$entry_original_config" "$original_entry_tags" "$exit_node_uuid" "$exit_profile_uuid" "$exit_profile_name" "$exit_original_config" "$original_exit_tags" "$service_user_uuid" "$squad_uuid"
         return 1
-    fi
+    }
 
     local service_username user_payload user_response
     service_username=$(cascade_safe_name "cascade_bridge_${stamp}")
@@ -560,61 +655,42 @@ create_vless_cascade() {
     user_response=$(cascade_api POST "/api/users" "$user_payload")
     if ! cascade_response_ok "$user_response"; then
         cascade_error "${LANG[CASCADE_USER_CREATE_ERROR]}: $user_response"
-        cascade_partial_cleanup "$entry_node_uuid" "$entry_profile_uuid" "$original_entry_inbounds" "$exit_node_uuid" "$exit_profile_uuid_original" "$original_exit_inbounds" "$entry_assigned" "$exit_assigned" "$entry_new_profile_uuid" "$exit_new_profile_uuid" "$service_user_uuid" "$squad_uuid"
+        cascade_partial_cleanup_in_place "$entry_modified" "$exit_modified" "$entry_node_uuid" "$entry_profile_uuid" "$entry_profile_name" "$entry_original_config" "$original_entry_tags" "$exit_node_uuid" "$exit_profile_uuid" "$exit_profile_name" "$exit_original_config" "$original_exit_tags" "$service_user_uuid" "$squad_uuid"
         return 1
     fi
     service_user_uuid=$(echo "$user_response" | jq -r '.response.uuid // empty')
     service_vless_uuid=$(echo "$user_response" | jq -r '.response.vlessUuid // empty')
     if [ -z "$service_user_uuid" ] || [ -z "$service_vless_uuid" ]; then
         cascade_error "${LANG[CASCADE_RESOURCE_ID_ERROR]}"
-        cascade_partial_cleanup "$entry_node_uuid" "$entry_profile_uuid" "$original_entry_inbounds" "$exit_node_uuid" "$exit_profile_uuid_original" "$original_exit_inbounds" "$entry_assigned" "$exit_assigned" "$entry_new_profile_uuid" "$exit_new_profile_uuid" "$service_user_uuid" "$squad_uuid"
+        cascade_partial_cleanup_in_place "$entry_modified" "$exit_modified" "$entry_node_uuid" "$entry_profile_uuid" "$entry_profile_name" "$entry_original_config" "$original_entry_tags" "$exit_node_uuid" "$exit_profile_uuid" "$exit_profile_name" "$exit_original_config" "$original_exit_tags" "$service_user_uuid" "$squad_uuid"
         return 1
     fi
 
-    local entry_config
     entry_config=$(cascade_build_entry_config "$entry_original_config" "$outbound_tag" "$exit_address" "$bridge_port" "$service_vless_uuid" "$public_key" "$short_id" "$reality_sni" "$entry_tags_json" "$routing_mode") || {
         cascade_error "${LANG[CASCADE_CONFIG_BUILD_ERROR]}"
-        cascade_partial_cleanup "$entry_node_uuid" "$entry_profile_uuid" "$original_entry_inbounds" "$exit_node_uuid" "$exit_profile_uuid_original" "$original_exit_inbounds" "$entry_assigned" "$exit_assigned" "$entry_new_profile_uuid" "$exit_new_profile_uuid" "$service_user_uuid" "$squad_uuid"
+        cascade_partial_cleanup_in_place "$entry_modified" "$exit_modified" "$entry_node_uuid" "$entry_profile_uuid" "$entry_profile_name" "$entry_original_config" "$original_entry_tags" "$exit_node_uuid" "$exit_profile_uuid" "$exit_profile_name" "$exit_original_config" "$original_exit_tags" "$service_user_uuid" "$squad_uuid"
         return 1
     }
 
-    local entry_clone_name entry_create_response entry_new_inbounds
-    entry_clone_name="CascadeEntry-${stamp}"
-    entry_create_response=$(cascade_create_profile "$entry_clone_name" "$entry_config")
-    if ! cascade_response_ok "$entry_create_response"; then
-        cascade_error "${LANG[CASCADE_ENTRY_PROFILE_CREATE_ERROR]}: $entry_create_response"
-        cascade_partial_cleanup "$entry_node_uuid" "$entry_profile_uuid" "$original_entry_inbounds" "$exit_node_uuid" "$exit_profile_uuid_original" "$original_exit_inbounds" "$entry_assigned" "$exit_assigned" "$entry_new_profile_uuid" "$exit_new_profile_uuid" "$service_user_uuid" "$squad_uuid"
+    if ! cascade_apply_profile_snapshot "$entry_node_uuid" "$entry_profile_uuid" "$entry_profile_name" "$entry_config" "$original_entry_tags"; then
+        cascade_error "${LANG[CASCADE_ENTRY_PROFILE_UPDATE_ERROR]}"
+        cascade_restore_profile_snapshot "$entry_node_uuid" "$entry_profile_uuid" "$entry_profile_name" "$entry_original_config" "$original_entry_tags" >/dev/null 2>&1 || true
+        cascade_partial_cleanup_in_place "$entry_modified" "$exit_modified" "$entry_node_uuid" "$entry_profile_uuid" "$entry_profile_name" "$entry_original_config" "$original_entry_tags" "$exit_node_uuid" "$exit_profile_uuid" "$exit_profile_name" "$exit_original_config" "$original_exit_tags" "$service_user_uuid" "$squad_uuid"
         return 1
     fi
-    entry_new_profile_uuid=$(echo "$entry_create_response" | jq -r '.response.uuid // empty')
-    entry_new_inbounds=$(cascade_map_active_tags "$entry_create_response" "$original_entry_tags")
-
-    if [ -z "$entry_new_profile_uuid" ] || ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$entry_new_inbounds" || [ "$(echo "$entry_new_inbounds" | jq 'length')" -eq 0 ]; then
-        cascade_error "${LANG[CASCADE_INBOUND_MAPPING_ERROR]}"
-        cascade_partial_cleanup "$entry_node_uuid" "$entry_profile_uuid" "$original_entry_inbounds" "$exit_node_uuid" "$exit_profile_uuid_original" "$original_exit_inbounds" "$entry_assigned" "$exit_assigned" "$entry_new_profile_uuid" "$exit_new_profile_uuid" "$service_user_uuid" "$squad_uuid"
-        return 1
-    fi
-
-    if ! cascade_assign_profile "$entry_node_uuid" "$entry_new_profile_uuid" "$entry_new_inbounds"; then
-        cascade_error "${LANG[CASCADE_ENTRY_ASSIGN_ERROR]}"
-        cascade_partial_cleanup "$entry_node_uuid" "$entry_profile_uuid" "$original_entry_inbounds" "$exit_node_uuid" "$exit_profile_uuid_original" "$original_exit_inbounds" "$entry_assigned" "$exit_assigned" "$entry_new_profile_uuid" "$exit_new_profile_uuid" "$service_user_uuid" "$squad_uuid"
-        return 1
-    fi
-    entry_assigned=true
+    entry_modified=true
 
     local state
     state=$(jq -n \
         --arg createdAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --arg entryNodeUuid "$entry_node_uuid" --arg entryNodeName "$entry_name" \
         --arg exitNodeUuid "$exit_node_uuid" --arg exitNodeName "$exit_name" \
-        --arg originalEntryProfileUuid "$entry_profile_uuid" \
-        --arg originalExitProfileUuid "$exit_profile_uuid_original" \
-        --argjson originalEntryInbounds "$original_entry_inbounds" \
-        --argjson originalExitInbounds "$original_exit_inbounds" \
-        --arg entryCascadeProfileUuid "$entry_new_profile_uuid" \
-        --arg exitCascadeProfileUuid "$exit_new_profile_uuid" \
-        --arg bridgeInboundUuid "$bridge_inbound_uuid" \
-        --arg bridgeInboundTag "$bridge_tag" \
+        --arg entryProfileUuid "$entry_profile_uuid" --arg entryProfileName "$entry_profile_name" \
+        --arg exitProfileUuid "$exit_profile_uuid" --arg exitProfileName "$exit_profile_name" \
+        --argjson originalEntryConfig "$entry_original_config" --argjson originalExitConfig "$exit_original_config" \
+        --argjson entryIntegrationConfig "$entry_config" --argjson exitIntegrationConfig "$exit_config" \
+        --argjson originalEntryInbounds "$original_entry_inbounds" --argjson originalExitInbounds "$original_exit_inbounds" \
+        --arg bridgeInboundUuid "$bridge_inbound_uuid" --arg bridgeInboundTag "$bridge_tag" \
         --arg outboundTag "$outbound_tag" \
         --arg squadUuid "$squad_uuid" --arg squadName "$squad_name" \
         --arg serviceUserUuid "$service_user_uuid" --arg serviceUsername "$service_username" \
@@ -624,18 +700,21 @@ create_vless_cascade() {
         --arg publicKey "$public_key" --arg shortId "$short_id" \
         --arg routingMode "$routing_mode" --argjson entryInboundTags "$entry_tags_json" \
         --argjson originalEntryTags "$original_entry_tags" --argjson originalExitTags "$original_exit_tags" \
-        '{version:2,enabled:true,createdAt:$createdAt,entry:{nodeUuid:$entryNodeUuid,nodeName:$entryNodeName,originalProfileUuid:$originalEntryProfileUuid,originalActiveInbounds:$originalEntryInbounds,originalActiveTags:$originalEntryTags,cascadeProfileUuid:$entryCascadeProfileUuid,inboundTags:$entryInboundTags,outboundTag:$outboundTag},exit:{nodeUuid:$exitNodeUuid,nodeName:$exitNodeName,originalProfileUuid:$originalExitProfileUuid,originalActiveInbounds:$originalExitInbounds,originalActiveTags:$originalExitTags,cascadeProfileUuid:$exitCascadeProfileUuid,address:$exitAddress,port:$bridgePort,bridgeInboundUuid:$bridgeInboundUuid,bridgeInboundTag:$bridgeInboundTag,realitySni:$realitySni,realityTarget:$realityTarget,publicKey:$publicKey,shortId:$shortId},service:{squadUuid:$squadUuid,squadName:$squadName,userUuid:$serviceUserUuid,username:$serviceUsername,vlessUuid:$serviceVlessUuid},routingMode:$routingMode}')
+        '{version:3,enabled:true,profileMode:"in_place",createdAt:$createdAt,
+          entry:{nodeUuid:$entryNodeUuid,nodeName:$entryNodeName,originalProfileUuid:$entryProfileUuid,cascadeProfileUuid:$entryProfileUuid,profileName:$entryProfileName,originalConfig:$originalEntryConfig,integrationConfig:$entryIntegrationConfig,originalActiveInbounds:$originalEntryInbounds,originalActiveTags:$originalEntryTags,inboundTags:$entryInboundTags,outboundTag:$outboundTag},
+          exit:{nodeUuid:$exitNodeUuid,nodeName:$exitNodeName,originalProfileUuid:$exitProfileUuid,cascadeProfileUuid:$exitProfileUuid,profileName:$exitProfileName,originalConfig:$originalExitConfig,integrationConfig:$exitIntegrationConfig,originalActiveInbounds:$originalExitInbounds,originalActiveTags:$originalExitTags,address:$exitAddress,port:$bridgePort,bridgeInboundUuid:$bridgeInboundUuid,bridgeInboundTag:$bridgeInboundTag,realitySni:$realitySni,realityTarget:$realityTarget,publicKey:$publicKey,shortId:$shortId},
+          service:{squadUuid:$squadUuid,squadName:$squadName,userUuid:$serviceUserUuid,username:$serviceUsername,vlessUuid:$serviceVlessUuid},routingMode:$routingMode}')
 
     umask 077
     local state_tmp="${CASCADE_STATE_FILE}.tmp.$$"
-    if ! jq -e 'type == "object" and .version == 2' >/dev/null 2>&1 <<< "$state" \
+    if ! jq -e 'type == "object" and .version == 3' >/dev/null 2>&1 <<< "$state" \
         || ! printf '%s\n' "$state" > "$state_tmp" \
         || ! jq -e . "$state_tmp" >/dev/null 2>&1 \
         || ! chmod 600 "$state_tmp" \
         || ! mv -f "$state_tmp" "$CASCADE_STATE_FILE"; then
         rm -f "$state_tmp"
         cascade_error "${LANG[CASCADE_STATE_WRITE_ERROR]}"
-        cascade_partial_cleanup "$entry_node_uuid" "$entry_profile_uuid" "$original_entry_inbounds" "$exit_node_uuid" "$exit_profile_uuid_original" "$original_exit_inbounds" "$entry_assigned" "$exit_assigned" "$entry_new_profile_uuid" "$exit_new_profile_uuid" "$service_user_uuid" "$squad_uuid"
+        cascade_partial_cleanup_in_place "$entry_modified" "$exit_modified" "$entry_node_uuid" "$entry_profile_uuid" "$entry_profile_name" "$entry_original_config" "$original_entry_tags" "$exit_node_uuid" "$exit_profile_uuid" "$exit_profile_name" "$exit_original_config" "$original_exit_tags" "$service_user_uuid" "$squad_uuid"
         return 1
     fi
 
@@ -678,8 +757,9 @@ cascade_status() {
     fi
 
     get_panel_token || return 1
-    local state entry_uuid exit_uuid enabled entry_profile exit_profile address port
+    local state version entry_uuid exit_uuid enabled entry_profile exit_profile address port
     state=$(cat "$CASCADE_STATE_FILE")
+    version=$(echo "$state" | jq -r '.version // 0')
     entry_uuid=$(echo "$state" | jq -r '.entry.nodeUuid')
     exit_uuid=$(echo "$state" | jq -r '.exit.nodeUuid')
     enabled=$(echo "$state" | jq -r '.enabled')
@@ -698,24 +778,54 @@ cascade_status() {
     printf "${LANG[CASCADE_STATUS_EXIT]}\n" "$(echo "$state" | jq -r '.exit.nodeName')" "$address" "$port"
     printf "${LANG[CASCADE_STATUS_MODE]}\n" "$(echo "$state" | jq -r '.routingMode')"
 
-    if cascade_response_ok "$entry_node"; then
-        local active_entry_profile
-        active_entry_profile=$(echo "$entry_node" | jq -r '.response.configProfile.activeConfigProfileUuid // empty')
-        if [ "$enabled" = "true" ] && [ "$active_entry_profile" = "$entry_profile" ]; then
-            cascade_ok "${LANG[CASCADE_ENTRY_PROFILE_OK]}"
-        elif [ "$enabled" = "false" ] && [ "$active_entry_profile" = "$(echo "$state" | jq -r '.entry.originalProfileUuid')" ]; then
-            cascade_ok "${LANG[CASCADE_ENTRY_DISABLED_OK]}"
+    if [ "$version" -ge 3 ]; then
+        local entry_profile_response exit_profile_response outbound_tag bridge_tag active_entry_profile active_exit_profile
+        outbound_tag=$(echo "$state" | jq -r '.entry.outboundTag')
+        bridge_tag=$(echo "$state" | jq -r '.exit.bridgeInboundTag')
+        active_entry_profile=$(echo "$entry_node" | jq -r '.response.configProfile.activeConfigProfileUuid // empty' 2>/dev/null)
+        active_exit_profile=$(echo "$exit_node" | jq -r '.response.configProfile.activeConfigProfileUuid // empty' 2>/dev/null)
+        entry_profile_response=$(cascade_get_profile "$entry_profile")
+        exit_profile_response=$(cascade_get_profile "$exit_profile")
+
+        if cascade_response_ok "$entry_node" && cascade_response_ok "$entry_profile_response" && [ "$active_entry_profile" = "$entry_profile" ]; then
+            if [ "$enabled" = "true" ] && echo "$entry_profile_response" | jq -e --arg tag "$outbound_tag" '.response.config.outbounds[]? | select(.tag == $tag)' >/dev/null 2>&1; then
+                cascade_ok "${LANG[CASCADE_ENTRY_PROFILE_OK]}"
+            elif [ "$enabled" = "false" ] && ! echo "$entry_profile_response" | jq -e --arg tag "$outbound_tag" '.response.config.outbounds[]? | select(.tag == $tag)' >/dev/null 2>&1; then
+                cascade_ok "${LANG[CASCADE_ENTRY_DISABLED_OK]}"
+            else
+                cascade_warn "${LANG[CASCADE_ENTRY_PROFILE_MISMATCH]}"
+            fi
         else
-            cascade_warn "${LANG[CASCADE_ENTRY_PROFILE_MISMATCH]}"
+            cascade_warn "${LANG[CASCADE_ENTRY_NODE_UNAVAILABLE]}"
+        fi
+
+        if cascade_response_ok "$exit_node" && cascade_response_ok "$exit_profile_response" \
+            && [ "$active_exit_profile" = "$exit_profile" ] \
+            && echo "$exit_profile_response" | jq -e --arg tag "$bridge_tag" '.response.config.inbounds[]? | select(.tag == $tag)' >/dev/null 2>&1; then
+            cascade_ok "${LANG[CASCADE_EXIT_PROFILE_OK]}"
+        else
+            cascade_warn "${LANG[CASCADE_EXIT_PROFILE_MISMATCH]}"
         fi
     else
-        cascade_warn "${LANG[CASCADE_ENTRY_NODE_UNAVAILABLE]}"
-    fi
+        if cascade_response_ok "$entry_node"; then
+            local active_entry_profile
+            active_entry_profile=$(echo "$entry_node" | jq -r '.response.configProfile.activeConfigProfileUuid // empty')
+            if [ "$enabled" = "true" ] && [ "$active_entry_profile" = "$entry_profile" ]; then
+                cascade_ok "${LANG[CASCADE_ENTRY_PROFILE_OK]}"
+            elif [ "$enabled" = "false" ] && [ "$active_entry_profile" = "$(echo "$state" | jq -r '.entry.originalProfileUuid')" ]; then
+                cascade_ok "${LANG[CASCADE_ENTRY_DISABLED_OK]}"
+            else
+                cascade_warn "${LANG[CASCADE_ENTRY_PROFILE_MISMATCH]}"
+            fi
+        else
+            cascade_warn "${LANG[CASCADE_ENTRY_NODE_UNAVAILABLE]}"
+        fi
 
-    if cascade_response_ok "$exit_node" && [ "$(echo "$exit_node" | jq -r '.response.configProfile.activeConfigProfileUuid // empty')" = "$exit_profile" ]; then
-        cascade_ok "${LANG[CASCADE_EXIT_PROFILE_OK]}"
-    else
-        cascade_warn "${LANG[CASCADE_EXIT_PROFILE_MISMATCH]}"
+        if cascade_response_ok "$exit_node" && [ "$(echo "$exit_node" | jq -r '.response.configProfile.activeConfigProfileUuid // empty')" = "$exit_profile" ]; then
+            cascade_ok "${LANG[CASCADE_EXIT_PROFILE_OK]}"
+        else
+            cascade_warn "${LANG[CASCADE_EXIT_PROFILE_MISMATCH]}"
+        fi
     fi
 
     if timeout 4 bash -c "</dev/tcp/${address}/${port}" >/dev/null 2>&1; then
@@ -730,7 +840,7 @@ cascade_write_enabled_state() {
     local tmp="${CASCADE_STATE_FILE}.tmp.$$"
 
     if ! jq --argjson enabled "$enabled" '.enabled=$enabled' "$CASCADE_STATE_FILE" > "$tmp" \
-        || ! jq -e 'type == "object" and .version == 2' "$tmp" >/dev/null 2>&1 \
+        || ! jq -e 'type == "object" and ((.version == 2) or (.version == 3))' "$tmp" >/dev/null 2>&1 \
         || ! chmod 600 "$tmp" \
         || ! mv -f "$tmp" "$CASCADE_STATE_FILE"; then
         rm -f "$tmp"
@@ -744,8 +854,37 @@ cascade_disable() {
     cascade_guard_awg3_dependency || return 1
     get_panel_token || return 1
 
-    local state node original_profile original_inbounds cascade_profile original_active_tags
+    local state version
     state=$(cat "$CASCADE_STATE_FILE")
+    version=$(echo "$state" | jq -r '.version // 0')
+
+    if [ "$version" -ge 3 ]; then
+        local node profile name original_config original_tags integration_config
+        node=$(echo "$state" | jq -r '.entry.nodeUuid')
+        profile=$(echo "$state" | jq -r '.entry.originalProfileUuid')
+        name=$(echo "$state" | jq -r '.entry.profileName')
+        original_config=$(echo "$state" | jq -c '.entry.originalConfig')
+        original_tags=$(echo "$state" | jq -c '.entry.originalActiveTags // []')
+        integration_config=$(echo "$state" | jq -c '.entry.integrationConfig')
+
+        if ! cascade_restore_profile_snapshot "$node" "$profile" "$name" "$original_config" "$original_tags"; then
+            cascade_error "${LANG[CASCADE_DISABLE_ERROR]}"
+            return 1
+        fi
+
+        if ! cascade_write_enabled_state false; then
+            cascade_apply_profile_snapshot "$node" "$profile" "$name" "$integration_config" "$original_tags" >/dev/null 2>&1 || true
+            cascade_restart_node "$node" >/dev/null 2>&1 || true
+            cascade_error "${LANG[CASCADE_STATE_WRITE_ERROR]}"
+            return 1
+        fi
+
+        cascade_restart_node "$node" >/dev/null 2>&1 || true
+        cascade_ok "${LANG[CASCADE_DISABLED]}"
+        return 0
+    fi
+
+    local node original_profile original_inbounds cascade_profile original_active_tags
     node=$(echo "$state" | jq -r '.entry.nodeUuid')
     original_profile=$(echo "$state" | jq -r '.entry.originalProfileUuid')
     original_inbounds=$(echo "$state" | jq -c '.entry.originalActiveInbounds')
@@ -779,8 +918,38 @@ cascade_enable() {
     cascade_guard_awg3_dependency || return 1
     get_panel_token || return 1
 
-    local state node cascade_profile profile_response cascade_inbounds original_active_tags original_profile original_inbounds
+    local state version
     state=$(cat "$CASCADE_STATE_FILE")
+    version=$(echo "$state" | jq -r '.version // 0')
+
+    if [ "$version" -ge 3 ]; then
+        local node profile name original_config original_tags integration_config
+        node=$(echo "$state" | jq -r '.entry.nodeUuid')
+        profile=$(echo "$state" | jq -r '.entry.originalProfileUuid')
+        name=$(echo "$state" | jq -r '.entry.profileName')
+        original_config=$(echo "$state" | jq -c '.entry.originalConfig')
+        original_tags=$(echo "$state" | jq -c '.entry.originalActiveTags // []')
+        integration_config=$(echo "$state" | jq -c '.entry.integrationConfig')
+
+        if ! cascade_apply_profile_snapshot "$node" "$profile" "$name" "$integration_config" "$original_tags"; then
+            cascade_error "${LANG[CASCADE_ENABLE_ERROR]}"
+            cascade_restore_profile_snapshot "$node" "$profile" "$name" "$original_config" "$original_tags" >/dev/null 2>&1 || true
+            return 1
+        fi
+
+        if ! cascade_write_enabled_state true; then
+            cascade_restore_profile_snapshot "$node" "$profile" "$name" "$original_config" "$original_tags" >/dev/null 2>&1 || true
+            cascade_restart_node "$node" >/dev/null 2>&1 || true
+            cascade_error "${LANG[CASCADE_STATE_WRITE_ERROR]}"
+            return 1
+        fi
+
+        cascade_restart_node "$node" >/dev/null 2>&1 || true
+        cascade_ok "${LANG[CASCADE_ENABLED]}"
+        return 0
+    fi
+
+    local node cascade_profile profile_response cascade_inbounds original_active_tags original_profile original_inbounds
     node=$(echo "$state" | jq -r '.entry.nodeUuid')
     cascade_profile=$(echo "$state" | jq -r '.entry.cascadeProfileUuid')
     original_active_tags=$(echo "$state" | jq -c '.entry.originalActiveTags // []')
@@ -825,8 +994,40 @@ remove_vless_cascade() {
     fi
 
     get_panel_token || return 1
-    local state
+    local state version
     state=$(cat "$CASCADE_STATE_FILE")
+    version=$(echo "$state" | jq -r '.version // 0')
+
+    if [ "$version" -ge 3 ]; then
+        local entry_node exit_node entry_profile exit_profile entry_name exit_name entry_config exit_config entry_tags exit_tags
+        entry_node=$(echo "$state" | jq -r '.entry.nodeUuid')
+        exit_node=$(echo "$state" | jq -r '.exit.nodeUuid')
+        entry_profile=$(echo "$state" | jq -r '.entry.originalProfileUuid')
+        exit_profile=$(echo "$state" | jq -r '.exit.originalProfileUuid')
+        entry_name=$(echo "$state" | jq -r '.entry.profileName')
+        exit_name=$(echo "$state" | jq -r '.exit.profileName')
+        entry_config=$(echo "$state" | jq -c '.entry.originalConfig')
+        exit_config=$(echo "$state" | jq -c '.exit.originalConfig')
+        entry_tags=$(echo "$state" | jq -c '.entry.originalActiveTags // []')
+        exit_tags=$(echo "$state" | jq -c '.exit.originalActiveTags // []')
+
+        cascade_restore_profile_snapshot "$entry_node" "$entry_profile" "$entry_name" "$entry_config" "$entry_tags" || {
+            cascade_error "${LANG[CASCADE_RESTORE_ENTRY_ERROR]}"
+            return 1
+        }
+        cascade_restore_profile_snapshot "$exit_node" "$exit_profile" "$exit_name" "$exit_config" "$exit_tags" || {
+            cascade_error "${LANG[CASCADE_RESTORE_EXIT_ERROR]}"
+            return 1
+        }
+
+        cascade_restart_node "$entry_node" >/dev/null 2>&1 || true
+        cascade_restart_node "$exit_node" >/dev/null 2>&1 || true
+        cascade_delete_resource "/api/users/$(echo "$state" | jq -r '.service.userUuid')" || cascade_warn "${LANG[CASCADE_DELETE_USER_WARN]}"
+        cascade_delete_resource "/api/internal-squads/$(echo "$state" | jq -r '.service.squadUuid')" || cascade_warn "${LANG[CASCADE_DELETE_SQUAD_WARN]}"
+        rm -f "$CASCADE_STATE_FILE"
+        cascade_ok "${LANG[CASCADE_REMOVED]}"
+        return 0
+    fi
 
     local entry_node exit_node original_entry_profile original_exit_profile original_entry_inbounds original_exit_inbounds
     entry_node=$(echo "$state" | jq -r '.entry.nodeUuid')

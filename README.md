@@ -61,7 +61,7 @@ Client → public VLESS inbound on entry node
        → direct Internet access from exit node
 ```
 
-The automation clones both Config Profiles, creates a service Internal Squad and user, assigns the profiles, restarts nodes and saves rollback data. It supports:
+The automation safely updates the entry and exit Config Profiles in place after saving their full JSON and active inbound tags for rollback. It then creates the service Internal Squad and user and restarts the nodes. Entry and exit nodes must use different Config Profiles. It supports:
 
 - all selected inbound traffic through the exit node;
 - Russian destinations directly through the entry node and other traffic through the exit node;

@@ -1,7 +1,7 @@
 # Ubuntu 24.04 audit
 
-Build: `3.0.2`  
-Date: 2026-08-07
+Build: `3.0.10`
+Date: 2026-08-09
 
 ## Scope
 
