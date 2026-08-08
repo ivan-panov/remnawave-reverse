@@ -538,13 +538,40 @@ awgr_find_node_compose_file() {
 
 awgr_container_has_net_admin() {
     docker inspect -f '{{json .HostConfig.CapAdd}}' remnanode 2>/dev/null | jq -e '
-        (. // []) | map(ascii_upcase) | index("NET_ADMIN") != null
+        (. // [])
+        | map(ascii_upcase | sub("^CAP_"; ""))
+        | index("NET_ADMIN") != null
+    ' >/dev/null 2>&1
+}
+
+awgr_compose_config_has_net_admin() {
+    local compose_file="$1"
+    local service_name="${2:-$AWGR_DOCKER_SERVICE}"
+    local compose_dir compose_name
+    compose_dir=$(dirname "$compose_file")
+    compose_name=$(basename "$compose_file")
+    (cd "$compose_dir" && docker compose -f "$compose_name" config --format json 2>/dev/null) | jq -e --arg service "$service_name" '
+        (.services[$service].cap_add // [])
+        | map(ascii_upcase | sub("^CAP_"; ""))
+        | index("NET_ADMIN") != null
     ' >/dev/null 2>&1
 }
 
 awgr_patch_compose_net_admin() {
     local compose_file="$1"
     local service_name="${2:-$AWGR_DOCKER_SERVICE}"
+
+    # Prefer structural YAML editing when yq v4 is available. This avoids
+    # indentation/anchor edge cases in already customized Compose files.
+    if command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -q 'version v4'; then
+        local current_caps
+        current_caps=$(yq eval ".services.\"${service_name}\".cap_add // [] | .[]" "$compose_file" 2>/dev/null || true)
+        if ! grep -Eiq '^(CAP_)?NET_ADMIN$' <<< "$current_caps"; then
+            yq eval -i ".services.\"${service_name}\".cap_add = ((.services.\"${service_name}\".cap_add // []) + [\"NET_ADMIN\"])" "$compose_file" || return 1
+        fi
+        return 0
+    fi
+
     python3 - "$compose_file" "$service_name" <<'PYCOMPOSE'
 from pathlib import Path
 import re, sys
@@ -644,10 +671,15 @@ PYCOMPOSE
 awgr_recreate_node_from_compose() {
     local compose_file="$1"
     local service_name="${2:-$AWGR_DOCKER_SERVICE}"
-    local compose_dir compose_name
+    local compose_dir compose_name project_name
     compose_dir=$(dirname "$compose_file")
     compose_name=$(basename "$compose_file")
-    (cd "$compose_dir" && docker compose -f "$compose_name" up -d "$service_name")
+    project_name=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' remnanode 2>/dev/null || true)
+    if [[ "$project_name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        (cd "$compose_dir" && docker compose -p "$project_name" -f "$compose_name" up -d --no-deps --force-recreate "$service_name")
+    else
+        (cd "$compose_dir" && docker compose -f "$compose_name" up -d --no-deps --force-recreate "$service_name")
+    fi
 }
 
 awgr_ensure_node_net_admin() {
@@ -667,6 +699,11 @@ awgr_ensure_node_net_admin() {
     cp -a "$compose_file" "$backup_file" || return 1
 
     if ! awgr_patch_compose_net_admin "$compose_file" "$AWGR_DOCKER_SERVICE"; then
+        cp -a "$backup_file" "$compose_file" >/dev/null 2>&1 || true
+        awgr_error "${LANG[AWGR_NET_ADMIN_PATCH_ERROR]}"
+        return 1
+    fi
+    if ! awgr_compose_config_has_net_admin "$compose_file" "$AWGR_DOCKER_SERVICE"; then
         cp -a "$backup_file" "$compose_file" >/dev/null 2>&1 || true
         awgr_error "${LANG[AWGR_NET_ADMIN_PATCH_ERROR]}"
         return 1

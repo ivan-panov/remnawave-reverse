@@ -320,6 +320,8 @@ installation() {
       remnawave:
         condition: service_healthy
     network_mode: host
+    cap_add:
+      - NET_ADMIN
     environment:
       - NODE_PORT=2222
       - SECRET_KEY="PUBLIC KEY FROM REMNAWAVE-PANEL"

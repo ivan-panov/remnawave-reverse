@@ -1,3 +1,10 @@
+# 3.0.4
+
+- Исправлено добавление `NET_ADMIN` контейнеру `remnanode` для AmneziaWG 3.0/TPROXY.
+- В новых установках Panel+Node `NET_ADMIN` задаётся сразу в Compose.
+- Для существующих установок пункт 13 предпочитает структурное изменение Compose через `yq`, проверяет итоговую конфигурацию через `docker compose config --format json`, затем пересоздаёт только `remnanode` с `--no-deps --force-recreate`.
+- Проверка capability принимает `NET_ADMIN` и `CAP_NET_ADMIN`.
+
 # 3.0.3
 
 - AmneziaWG 3.0 module now recreates the pinned v5.24.0 launcher automatically when `/usr/local/remnawave_reverse/vendor/amneziawg-installer/install_amneziawg.sh` is missing after an in-place updater run or a raw-script installation.
