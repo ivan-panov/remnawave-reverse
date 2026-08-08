@@ -1,3 +1,10 @@
+# 3.0.9
+
+- Standalone Nginx Node now mounts `/etc/letsencrypt` read-only as a complete tree, so Certbot `live -> archive` symlinks remain valid inside the container and after renewals.
+- Standalone Node nginx configuration now reads certificates directly from `/etc/letsencrypt/live/<domain>/`.
+- Startup self-repair migrates existing `/etc/nginx/ssl/...` Node configs, adds the mount to the correct `remnawave-nginx` service, recreates only that container, then verifies certificate readability and `nginx -t`.
+- Repair now detects a stale running container by Docker mount inspection and performs rollback with logs if live verification fails.
+
 # 3.0.8
 
 - Исправлена установка Nginx для отдельной Remnawave Node: сертификаты теперь монтируются в `/opt/remnanode/docker-compose.yml`, а не в `/opt/remnawave/docker-compose.yml`.

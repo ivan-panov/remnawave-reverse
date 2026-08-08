@@ -77,6 +77,7 @@ services:
     network_mode: host
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
 EOL
 }
 
@@ -171,9 +172,9 @@ server {
     listen unix:/dev/shm/nginx.sock ssl proxy_protocol;
     http2 on;
 
-    ssl_certificate "/etc/nginx/ssl/$NODE_CERT_DOMAIN/fullchain.pem";
-    ssl_certificate_key "/etc/nginx/ssl/$NODE_CERT_DOMAIN/privkey.pem";
-    ssl_trusted_certificate "/etc/nginx/ssl/$NODE_CERT_DOMAIN/fullchain.pem";
+    ssl_certificate "/etc/letsencrypt/live/$NODE_CERT_DOMAIN/fullchain.pem";
+    ssl_certificate_key "/etc/letsencrypt/live/$NODE_CERT_DOMAIN/privkey.pem";
+    ssl_trusted_certificate "/etc/letsencrypt/live/$NODE_CERT_DOMAIN/fullchain.pem";
 
     root /var/www/html;
     index index.html;

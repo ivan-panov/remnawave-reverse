@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="3.0.8"
+SCRIPT_VERSION="3.0.9"
 CUSTOM_BUILD=false
 
 # Repository used for installation and self-updates. It can be overridden for
@@ -2169,9 +2169,88 @@ fix_letsencrypt_structure() {
 }
 #Manage Certificates
 
+ensure_compose_service_volume() {
+    local compose_file="$1"
+    local service_name="$2"
+    local mount_line="$3"
+    local tmp_file
+
+    [ -f "$compose_file" ] || return 1
+
+    # Do not trust a matching line outside the target service. Insert the
+    # volume under services.<service_name>.volumes and validate Compose later.
+    if awk -v service="$service_name" -v wanted="$mount_line" '
+        function is_service(line) { return line ~ /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ }
+        $0 ~ "^  " service ":[[:space:]]*$" { inside=1; next }
+        inside && is_service($0) { inside=0 }
+        inside && $0 == wanted { found=1 }
+        END { exit(found ? 0 : 1) }
+    ' "$compose_file"; then
+        return 0
+    fi
+
+    tmp_file=$(mktemp) || return 1
+    if ! awk -v service="$service_name" -v wanted="$mount_line" '
+        function is_service(line) { return line ~ /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ }
+        function flush_missing_volumes() {
+            if (inside && !inserted) {
+                print "    volumes:"
+                print wanted
+                inserted=1
+            }
+        }
+        {
+            if ($0 ~ "^  " service ":[[:space:]]*$") {
+                inside=1
+                inserted=0
+                print
+                next
+            }
+            if (inside && is_service($0)) {
+                flush_missing_volumes()
+                inside=0
+            }
+            if (inside && $0 ~ /^    volumes:[[:space:]]*$/) {
+                print
+                if (!inserted) {
+                    print wanted
+                    inserted=1
+                }
+                next
+            }
+            print
+        }
+        END { flush_missing_volumes() }
+    ' "$compose_file" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    cat "$tmp_file" > "$compose_file"
+    rm -f "$tmp_file"
+
+    awk -v service="$service_name" -v wanted="$mount_line" '
+        function is_service(line) { return line ~ /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ }
+        $0 ~ "^  " service ":[[:space:]]*$" { inside=1; next }
+        inside && is_service($0) { inside=0 }
+        inside && $0 == wanted { found=1 }
+        END { exit(found ? 0 : 1) }
+    ' "$compose_file"
+}
+
 append_nginx_cert_mounts() {
     local compose_file="$1"
     local cert_domain="$2"
+
+    # Standalone Node uses the complete Let's Encrypt tree read-only.  This is
+    # important because files in /etc/letsencrypt/live are symlinks into
+    # /etc/letsencrypt/archive and the symlink target changes after renewal.
+    if [ "$compose_file" = "/opt/remnanode/docker-compose.yml" ]; then
+        ensure_compose_service_volume "$compose_file" "remnawave-nginx" \
+            "      - /etc/letsencrypt:/etc/letsencrypt:ro"
+        return $?
+    fi
+
     local fullchain_mount="      - /etc/letsencrypt/live/$cert_domain/fullchain.pem:/etc/nginx/ssl/$cert_domain/fullchain.pem:ro"
     local privkey_mount="      - /etc/letsencrypt/live/$cert_domain/privkey.pem:/etc/nginx/ssl/$cert_domain/privkey.pem:ro"
 
@@ -2383,54 +2462,87 @@ repair_existing_node_nginx_cert_mounts() {
     local target_dir="/opt/remnanode"
     local compose_file="$target_dir/docker-compose.yml"
     local nginx_conf="$target_dir/nginx.conf"
-    local backup_file="$compose_file.remnawave-3.0.8.bak"
+    local compose_backup="$compose_file.remnawave-3.0.9.bak"
+    local nginx_backup="$nginx_conf.remnawave-3.0.9.bak"
+    local letsencrypt_mount="      - /etc/letsencrypt:/etc/letsencrypt:ro"
 
     [ -f "$compose_file" ] || return 0
     [ -f "$nginx_conf" ] || return 0
-    grep -q '/etc/nginx/ssl/' "$nginx_conf" || return 0
+    docker inspect remnawave-nginx >/dev/null 2>&1 || return 0
 
+    # Read every certificate domain referenced by the standalone fallback
+    # configuration. Support both the legacy /etc/nginx/ssl layout and the
+    # new direct /etc/letsencrypt/live layout.
     local cert_domains
-    cert_domains=$(sed -nE 's#.*ssl_certificate[[:space:]]+"?/etc/nginx/ssl/([^/]+)/fullchain\.pem"?;.*#\1#p' "$nginx_conf" | sort -u)
+    cert_domains=$(sed -nE \
+        -e 's#.*ssl_certificate(_key)?[[:space:]]+"?/etc/nginx/ssl/([^/]+)/(fullchain|privkey)\.pem"?;.*#\2#p' \
+        -e 's#.*ssl_certificate(_key)?[[:space:]]+"?/etc/letsencrypt/live/([^/]+)/(fullchain|privkey)\.pem"?;.*#\2#p' \
+        "$nginx_conf" | sort -u)
+
     [ -n "$cert_domains" ] || return 0
 
-    local need_repair=false
-    local cert_domain
+    local cert_domain resolved_fullchain resolved_privkey
     while IFS= read -r cert_domain; do
         [ -n "$cert_domain" ] || continue
-        [ -f "/etc/letsencrypt/live/$cert_domain/fullchain.pem" ] || continue
-        [ -f "/etc/letsencrypt/live/$cert_domain/privkey.pem" ] || continue
-        if ! grep -Fq -- "/etc/letsencrypt/live/$cert_domain/fullchain.pem:/etc/nginx/ssl/$cert_domain/fullchain.pem:ro" "$compose_file" || \
-           ! grep -Fq -- "/etc/letsencrypt/live/$cert_domain/privkey.pem:/etc/nginx/ssl/$cert_domain/privkey.pem:ro" "$compose_file"; then
-            need_repair=true
-            break
+        resolved_fullchain=$(readlink -e "/etc/letsencrypt/live/$cert_domain/fullchain.pem" 2>/dev/null || true)
+        resolved_privkey=$(readlink -e "/etc/letsencrypt/live/$cert_domain/privkey.pem" 2>/dev/null || true)
+        if [ -z "$resolved_fullchain" ] || [ -z "$resolved_privkey" ]; then
+            echo -e "${COLOR_RED}${LANG[NODE_CERT_REPAIR_CERT_MISSING]} $cert_domain${COLOR_RESET}"
+            return 1
         fi
     done <<< "$cert_domains"
 
+    local need_repair=false
+    if grep -q '/etc/nginx/ssl/' "$nginx_conf"; then
+        need_repair=true
+    fi
+    if ! awk -v service="remnawave-nginx" -v wanted="$letsencrypt_mount" '
+        function is_service(line) { return line ~ /^  [A-Za-z0-9_.-]+:[[:space:]]*$/ }
+        $0 ~ "^  " service ":[[:space:]]*$" { inside=1; next }
+        inside && is_service($0) { inside=0 }
+        inside && $0 == wanted { found=1 }
+        END { exit(found ? 0 : 1) }
+    ' "$compose_file"; then
+        need_repair=true
+    fi
+
+    # Also repair when the running container was created from an older compose
+    # and does not actually contain the Let's Encrypt bind mount.
+    if ! docker inspect remnawave-nginx --format '{{range .Mounts}}{{println .Destination}}{{end}}' 2>/dev/null | \
+         grep -Fxq '/etc/letsencrypt'; then
+        need_repair=true
+    fi
+
     [ "$need_repair" = true ] || return 0
 
-    cp -a "$compose_file" "$backup_file" || return 1
+    cp -a "$compose_file" "$compose_backup" || return 1
+    cp -a "$nginx_conf" "$nginx_backup" || { rm -f "$compose_backup"; return 1; }
 
+    if ! ensure_compose_service_volume "$compose_file" "remnawave-nginx" "$letsencrypt_mount"; then
+        mv -f "$compose_backup" "$compose_file"
+        mv -f "$nginx_backup" "$nginx_conf"
+        echo -e "${COLOR_RED}${LANG[NODE_CERT_REPAIR_FAILED]}${COLOR_RESET}"
+        return 1
+    fi
+
+    # Let nginx follow Certbot's live -> archive links inside the container.
+    # Mounting the whole tree also means future certificate versions remain
+    # visible without changing the compose source path.
+    sed -Ei \
+        -e 's#/etc/nginx/ssl/([^/]+)/fullchain\.pem#/etc/letsencrypt/live/\1/fullchain.pem#g' \
+        -e 's#/etc/nginx/ssl/([^/]+)/privkey\.pem#/etc/letsencrypt/live/\1/privkey.pem#g' \
+        "$nginx_conf"
+
+    if ! (cd "$target_dir" && docker compose config >/dev/null 2>&1); then
+        mv -f "$compose_backup" "$compose_file"
+        mv -f "$nginx_backup" "$nginx_conf"
+        echo -e "${COLOR_RED}${LANG[NODE_CERT_REPAIR_FAILED]}${COLOR_RESET}"
+        return 1
+    fi
+
+    # Keep renewal hooks pointed at the standalone Node compose project.
     while IFS= read -r cert_domain; do
         [ -n "$cert_domain" ] || continue
-        [ -f "/etc/letsencrypt/live/$cert_domain/fullchain.pem" ] || continue
-        [ -f "/etc/letsencrypt/live/$cert_domain/privkey.pem" ] || continue
-
-        local fullchain_mount="      - /etc/letsencrypt/live/$cert_domain/fullchain.pem:/etc/nginx/ssl/$cert_domain/fullchain.pem:ro"
-        local privkey_mount="      - /etc/letsencrypt/live/$cert_domain/privkey.pem:/etc/nginx/ssl/$cert_domain/privkey.pem:ro"
-
-        if ! grep -Fqx -- "$fullchain_mount" "$compose_file"; then
-            local compose_tmp
-            compose_tmp=$(mktemp) || { mv -f "$backup_file" "$compose_file"; return 1; }
-            awk -v mount_line="$fullchain_mount" '{ print; if ($0 ~ /^[[:space:]]*- \.\/nginx\.conf:\/etc\/nginx\/conf\.d\/default\.conf:ro$/) print mount_line }' "$compose_file" > "$compose_tmp" && cat "$compose_tmp" > "$compose_file"
-            rm -f "$compose_tmp"
-        fi
-        if ! grep -Fqx -- "$privkey_mount" "$compose_file"; then
-            local compose_tmp
-            compose_tmp=$(mktemp) || { mv -f "$backup_file" "$compose_file"; return 1; }
-            awk -v mount_line="$privkey_mount" '{ print; if ($0 ~ /^[[:space:]]*- \.\/nginx\.conf:\/etc\/nginx\/conf\.d\/default\.conf:ro$/) print mount_line }' "$compose_file" > "$compose_tmp" && cat "$compose_tmp" > "$compose_file"
-            rm -f "$compose_tmp"
-        fi
-
         local renewal_conf="/etc/letsencrypt/renewal/$cert_domain.conf"
         if [ -f "$renewal_conf" ]; then
             local desired_hook="renew_hook = sh -c 'cd /opt/remnanode && docker compose up -d --no-deps --force-recreate remnawave-nginx'"
@@ -2439,30 +2551,48 @@ repair_existing_node_nginx_cert_mounts() {
         fi
     done <<< "$cert_domains"
 
-    while IFS= read -r cert_domain; do
-        [ -n "$cert_domain" ] || continue
-        [ -f "/etc/letsencrypt/live/$cert_domain/fullchain.pem" ] || continue
-        [ -f "/etc/letsencrypt/live/$cert_domain/privkey.pem" ] || continue
-        if ! grep -Fq -- "/etc/letsencrypt/live/$cert_domain/fullchain.pem:/etc/nginx/ssl/$cert_domain/fullchain.pem:ro" "$compose_file" || \
-           ! grep -Fq -- "/etc/letsencrypt/live/$cert_domain/privkey.pem:/etc/nginx/ssl/$cert_domain/privkey.pem:ro" "$compose_file"; then
-            mv -f "$backup_file" "$compose_file"
-            echo -e "${COLOR_RED}${LANG[NODE_CERT_REPAIR_FAILED]}${COLOR_RESET}"
-            return 1
-        fi
-    done <<< "$cert_domains"
-
-    if ! (cd "$target_dir" && docker compose config >/dev/null 2>&1); then
-        mv -f "$backup_file" "$compose_file"
+    if ! (cd "$target_dir" && docker compose up -d --no-deps --force-recreate remnawave-nginx >/dev/null 2>&1); then
+        mv -f "$compose_backup" "$compose_file"
+        mv -f "$nginx_backup" "$nginx_conf"
+        (cd "$target_dir" && docker compose up -d --no-deps --force-recreate remnawave-nginx >/dev/null 2>&1) || true
         echo -e "${COLOR_RED}${LANG[NODE_CERT_REPAIR_FAILED]}${COLOR_RESET}"
         return 1
     fi
 
-    rm -f "$backup_file"
-    echo -e "${COLOR_GREEN}${LANG[NODE_CERT_REPAIR_DONE]}${COLOR_RESET}"
+    local ok=false attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 2
+        if [ "$(docker inspect -f '{{.State.Running}}' remnawave-nginx 2>/dev/null)" != "true" ]; then
+            continue
+        fi
 
-    if docker inspect remnawave-nginx >/dev/null 2>&1; then
+        local certs_visible=true
+        while IFS= read -r cert_domain; do
+            [ -n "$cert_domain" ] || continue
+            if ! docker exec remnawave-nginx test -r "/etc/letsencrypt/live/$cert_domain/fullchain.pem" >/dev/null 2>&1 || \
+               ! docker exec remnawave-nginx test -r "/etc/letsencrypt/live/$cert_domain/privkey.pem" >/dev/null 2>&1; then
+                certs_visible=false
+                break
+            fi
+        done <<< "$cert_domains"
+
+        if [ "$certs_visible" = true ] && docker exec remnawave-nginx nginx -t >/dev/null 2>&1; then
+            ok=true
+            break
+        fi
+    done
+
+    if [ "$ok" != true ]; then
+        echo -e "${COLOR_RED}${LANG[NODE_CERT_REPAIR_VERIFY_FAILED]}${COLOR_RESET}"
+        docker logs remnawave-nginx --tail 30 2>&1 || true
+        mv -f "$compose_backup" "$compose_file"
+        mv -f "$nginx_backup" "$nginx_conf"
         (cd "$target_dir" && docker compose up -d --no-deps --force-recreate remnawave-nginx >/dev/null 2>&1) || true
+        return 1
     fi
+
+    rm -f "$compose_backup" "$nginx_backup"
+    echo -e "${COLOR_GREEN}${LANG[NODE_CERT_REPAIR_DONE]}${COLOR_RESET}"
     return 0
 }
 

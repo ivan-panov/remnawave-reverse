@@ -249,8 +249,10 @@ LANG[NODE_UNAVAILABLE]="Локальная готовность ноды не п
 LANG[NODE_LAUNCHED]="Remnawave Node и локальный fallback-прокси успешно запущены!"
 LANG[NODE_NOT_CONNECTED]="Локальный стек ноды не готов после %d попыток!"
 LANG[CHECK_CONFIG]="Проверьте remnanode, fallback-прокси, Unix socket /dev/shm/nginx.sock и TCP/2222."
-LANG[NODE_CERT_REPAIR_DONE]="Исправлены отсутствующие volume-монты сертификата для /opt/remnanode; remnawave-nginx пересоздан."
+LANG[NODE_CERT_REPAIR_DONE]="Доступ standalone Node к сертификатам исправлен: /etc/letsencrypt смонтирован read-only, nginx.conf обновлён, remnawave-nginx проверен и пересоздан."
 LANG[NODE_CERT_REPAIR_FAILED]="Не удалось безопасно исправить volume-монты сертификата Node; исходный docker-compose.yml восстановлен."
+LANG[NODE_CERT_REPAIR_CERT_MISSING]="Сертификат Node указан в nginx.conf, но его файлы Certbot отсутствуют или ссылка повреждена:"
+LANG[NODE_CERT_REPAIR_VERIFY_FAILED]="После ремонта remnawave-nginx не прошёл проверку сертификата/nginx -t; изменения откатываются."
 #Add node to panel
 LANG[ADD_NODE_TO_PANEL]="Добавить ноду в панель"
 LANG[ENTER_NODE_NAME]="Введите имя для вашей ноды (например, Germany):"
