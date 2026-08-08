@@ -5,7 +5,7 @@
    <img alt="Remnawave Reverse Proxy" src="https://github.com/eGamesAPI/remnawave-reverse-proxy" />
  </picture>
 </a></p>
-
+---
 <p align="center">
 <a href="./README-RU.md">Русский</a> |
 <strong>English</strong>
