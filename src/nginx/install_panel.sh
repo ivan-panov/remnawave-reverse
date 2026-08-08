@@ -266,7 +266,7 @@ installation() {
     domains_to_check["$SUB_DOMAIN"]=1
     domains_to_check["$SELFSTEAL_DOMAIN"]=1
 
-    handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL"
+    handle_certificates domains_to_check "$CERT_METHOD" "$LETSENCRYPT_EMAIL" "/opt/remnawave" || return 1
 
     if [ -z "$CERT_METHOD" ]; then
         local base_domain=$(extract_domain "$PANEL_DOMAIN")

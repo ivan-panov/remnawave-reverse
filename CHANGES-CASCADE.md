@@ -1,3 +1,11 @@
+# 3.0.8
+
+- Исправлена установка Nginx для отдельной Remnawave Node: сертификаты теперь монтируются в `/opt/remnanode/docker-compose.yml`, а не в `/opt/remnawave/docker-compose.yml`.
+- Пути deploy-hook Certbot теперь соответствуют реальному каталогу установки (`/opt/remnawave` или `/opt/remnanode`).
+- Добавлено безопасное автоисправление уже установленной отдельной Node: при отсутствии certificate volume mounts создаётся резервная копия Compose, добавляются только существующие сертификаты, выполняется `docker compose config`, затем пересоздаётся только `remnawave-nginx`.
+- Проверка запуска отдельной Node больше не зависит от `curl https://SELFSTEAL_DOMAIN`: при REALITY этот запрос может штатно попадать в target. Теперь проверяются контейнер `remnanode`, fallback-контейнер, TCP/2222 и `/dev/shm/nginx.sock`.
+- Исправлены ошибочно переименованные PNG-файлы документации `logo.webp`, `banner.webp`, `banner-black.webp`: теперь это настоящие WebP, чтобы Astro build не падал на image metadata.
+
 # 3.0.7
 
 - Исправлено создание Config Profile для VLESS-каскада: Remnawave ограничивает поле `name` длиной 30 символов, а прежние имена `Cascade Exit - <node> - <timestamp>` и `Cascade Entry - <node> - <timestamp>` гарантированно могли превышать лимит.
