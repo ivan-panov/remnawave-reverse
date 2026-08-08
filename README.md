@@ -247,7 +247,7 @@ Then select:
 1. Create integration automatically
 ```
 
-The module can install AWG, continue after required reboots, create the transparent Xray inbound, add policy-routing rules and select an existing Remnawave outbound.
+The module can install AWG, continue after required reboots, create the transparent Xray inbound, add policy-routing rules and select an existing Remnawave outbound. For a new installation you may optionally provide a client FQDN (`Endpoint = awg.example.com:PORT`); DNS is verified against the VPS public IPv4 address and no SSL certificate is required for the AWG domain.
 
 Do not mix an old AWG 2.0 integration with the AWG 3.0 module. Remove the legacy integration using its original build first.
 

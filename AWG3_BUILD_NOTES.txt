@@ -12,6 +12,7 @@ Changes:
 - Module version is stored in state and shown in diagnostics.
 - Runtime service, chain, rule tags and Xray inbound names use AWG3 identifiers.
 - Official AWG installer still runs with --no-tweaks to avoid replacing Remnawave host hardening.
+- New AWG installs may use an optional FQDN client endpoint. The integration verifies DNS A -> current VPS public IPv4, persists it through reboot bootstrap, and passes it to upstream with --endpoint=FQDN. No SSL certificate is requested for this UDP endpoint.
 
 Important:
 - Upstream v5.24.0 does not enable every experimental AWG 3.0 feature by default.

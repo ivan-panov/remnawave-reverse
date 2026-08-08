@@ -34,6 +34,84 @@ awgr_safe_name() {
     printf '%s' "$1" | tr -cs '[:alnum:]_-' '_' | cut -c1-40
 }
 
+# Optional client endpoint hostname. The upstream AWG installer supports
+# --endpoint=FQDN and writes that value into generated client configurations.
+# We validate it before making any Remnawave/profile changes and additionally
+# require its A record to point to this VPS public IPv4 address.
+awgr_valid_fqdn() {
+    local host="${1%.}"
+    [ -n "$host" ] && [ "${#host}" -le 253 ] || return 1
+    [[ "$host" == *.* ]] || return 1
+    [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+    local label
+    local -a _awgr_labels=()
+    IFS='.' read -r -a _awgr_labels <<< "$host"
+    for label in "${_awgr_labels[@]}"; do
+        [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+awgr_is_public_ipv4() {
+    python3 - "$1" <<'PYIP' >/dev/null 2>&1
+import ipaddress, sys
+try:
+    ip = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if ip.version == 4 and ip.is_global else 1)
+PYIP
+}
+
+awgr_public_ipv4() {
+    local candidate url
+
+    # Prefer the address selected by the host routing table; on a normal VPS it
+    # is the public address and avoids depending on an external HTTP service.
+    candidate=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+    if [ -n "$candidate" ] && awgr_is_public_ipv4 "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    for url in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
+        candidate=$(curl -4fsS --connect-timeout 5 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ -n "$candidate" ] && awgr_is_public_ipv4 "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+awgr_resolve_ipv4() {
+    python3 - "$1" <<'PYDNS'
+import ipaddress
+import socket
+import sys
+
+host = sys.argv[1]
+try:
+    infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)
+except socket.gaierror:
+    raise SystemExit(1)
+
+addresses = []
+for info in infos:
+    addr = info[4][0]
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        continue
+    if ip.version == 4 and addr not in addresses:
+        addresses.append(addr)
+
+if not addresses:
+    raise SystemExit(1)
+print("\n".join(addresses))
+PYDNS
+}
+
 awgr_response_ok() {
     local response="$1"
     [ -n "$response" ] || return 1
@@ -332,11 +410,13 @@ awgr_read_existing_awg() {
         AWGR_EXISTING_SUBNET="${AWG_TUNNEL_SUBNET:-}"
         AWGR_EXISTING_PRESET="${AWG_PRESET:-default}"
         AWGR_EXISTING_SERVER_NAME="${AWG_SERVER_NAME:-Remnawave AWG3 RU}"
+        AWGR_EXISTING_ENDPOINT="${AWG_ENDPOINT:-}"
     elif [ -f "$server_file" ]; then
         AWGR_EXISTING_PORT=$(awk -F= '/^[[:space:]]*ListenPort[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$server_file")
         AWGR_EXISTING_SUBNET=$(awk -F= '/^[[:space:]]*Address[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$server_file")
         AWGR_EXISTING_PRESET="default"
         AWGR_EXISTING_SERVER_NAME="Remnawave AWG3 RU"
+        AWGR_EXISTING_ENDPOINT=""
     else
         return 1
     fi
@@ -981,6 +1061,9 @@ args=(
 if [ "${AWG_BOOT_PRESET:-default}" = "mobile" ]; then
     args+=("--preset=mobile")
 fi
+if [ -n "${AWG_BOOT_ENDPOINT:-}" ]; then
+    args+=("--endpoint=${AWG_BOOT_ENDPOINT}")
+fi
 
 bash "$AWG_BOOT_INSTALLER" "${args[@]}"
 
@@ -1025,6 +1108,7 @@ awgr_write_bootstrap_env() {
     local awg_subnet="$2"
     local preset="$3"
     local server_name="$4"
+    local endpoint="${5:-}"
 
     umask 077
     {
@@ -1033,6 +1117,7 @@ awgr_write_bootstrap_env() {
         printf 'AWG_BOOT_SUBNET=%q\n' "$awg_subnet"
         printf 'AWG_BOOT_PRESET=%q\n' "$preset"
         printf 'AWG_BOOT_SERVER_NAME=%q\n' "$server_name"
+        printf 'AWG_BOOT_ENDPOINT=%q\n' "$endpoint"
     } > "$AWGR_BOOTSTRAP_ENV"
     chmod 600 "$AWGR_BOOTSTRAP_ENV"
 }
@@ -1175,7 +1260,7 @@ create_amneziawg_remnawave_integration() {
         return 1
     fi
 
-    local awg_installed=false awg_port awg_subnet awg_preset="default" awg_server_name
+    local awg_installed=false awg_port awg_subnet awg_preset="default" awg_server_name awg_endpoint=""
     if systemctl is-active --quiet awg-quick@awg0.service && ip link show awg0 >/dev/null 2>&1; then
         if ! awgr_read_existing_awg; then
             awgr_error "${LANG[AWGR_EXISTING_AWG_CONFIG_ERROR]}"
@@ -1186,6 +1271,7 @@ create_amneziawg_remnawave_integration() {
         awg_subnet="$AWGR_EXISTING_SUBNET"
         awg_preset="$AWGR_EXISTING_PRESET"
         awg_server_name="$AWGR_EXISTING_SERVER_NAME"
+        awg_endpoint="${AWGR_EXISTING_ENDPOINT:-}"
         awgr_ok "${LANG[AWGR_EXISTING_AWG_FOUND]}"
     elif [ -f "$AWGR_AWG_CONFIG" ] || [ -f "$AWGR_AWG_SERVER_CONFIG" ] || ip link show awg0 >/dev/null 2>&1; then
         awgr_error "${LANG[AWGR_EXISTING_AWG_INACTIVE]}"
@@ -1222,6 +1308,32 @@ PY
             *) awgr_error "${LANG[INVALID_CHOICE]}"; return 1 ;;
         esac
         awg_server_name="Remnawave AWG3 RU"
+
+        reading "${LANG[AWGR_ENDPOINT_PROMPT]}" awg_endpoint
+        awg_endpoint="${awg_endpoint%.}"
+        if [ -n "$awg_endpoint" ]; then
+            if ! awgr_valid_fqdn "$awg_endpoint"; then
+                awgr_error "${LANG[AWGR_ENDPOINT_INVALID]}"
+                return 1
+            fi
+
+            local awg_public_ip awg_resolved_ips
+            if ! awg_public_ip=$(awgr_public_ipv4); then
+                awgr_error "${LANG[AWGR_PUBLIC_IP_ERROR]}"
+                return 1
+            fi
+            if ! awg_resolved_ips=$(awgr_resolve_ipv4 "$awg_endpoint"); then
+                awgr_error "$(printf "${LANG[AWGR_ENDPOINT_RESOLVE_ERROR]}" "$awg_endpoint")"
+                return 1
+            fi
+            if ! grep -Fqx "$awg_public_ip" <<< "$awg_resolved_ips"; then
+                awgr_error "$(printf "${LANG[AWGR_ENDPOINT_MISMATCH]}" "$awg_endpoint" "$(tr '\n' ',' <<< "$awg_resolved_ips" | sed 's/,$//')" "$awg_public_ip")"
+                return 1
+            fi
+            awgr_ok "$(printf "${LANG[AWGR_ENDPOINT_OK]}" "$awg_endpoint" "$awg_public_ip")"
+        else
+            awgr_info "${LANG[AWGR_ENDPOINT_AUTO]}"
+        fi
     fi
 
     # The installer stores server_address/prefix (for example 10.9.9.1/24),
@@ -1308,12 +1420,12 @@ PYNET
         --arg integrationUuid "$new_profile_uuid" --arg integrationName "$new_profile_name" --argjson integrationActiveInbounds "$new_active_inbounds" \
         --arg inboundUuid "$new_inbound_uuid" --arg inboundTag "$inbound_tag" --argjson tproxyPort "$tproxy_port" \
         --arg outboundTag "$outbound_tag" --arg outboundProtocol "$outbound_protocol" --arg directTag "$direct_tag" --arg routeMode "$route_mode" \
-        --arg awgPort "$awg_port" --arg awgSubnet "$awg_subnet" --arg awgPreset "$awg_preset" --arg awgServerName "$awg_server_name" \
+        --arg awgPort "$awg_port" --arg awgSubnet "$awg_subnet" --arg awgPreset "$awg_preset" --arg awgServerName "$awg_server_name" --arg awgEndpoint "$awg_endpoint" \
         --arg awgModuleVersion "$awg_module_version" --argjson awgPreinstalled "$awg_installed" \
         --arg hostMark "$AWGR_SELECTED_MARK" --argjson hostTable "$AWGR_SELECTED_TABLE" --argjson hostPriority "$AWGR_SELECTED_PRIORITY" \
         --argjson previousIpForward "$previous_ip_forward" --argjson previousSrcValidMark "$previous_src_valid_mark" \
         --arg dockerComposeFile "$AWGR_DOCKER_COMPOSE_FILE" --arg dockerService "$AWGR_DOCKER_SERVICE" --argjson dockerCapAdded "$AWGR_DOCKER_CAP_ADDED" \
-        '{version:4,createdAt:$createdAt,enabled:false,bootstrapPending:($awgPreinstalled|not),node:{uuid:$nodeUuid,name:$nodeName,address:$nodeAddress},profile:{originalUuid:$originalUuid,originalName:$originalName,originalConfig:$originalConfig,originalActiveInbounds:$originalActiveInbounds,originalActiveTags:$originalActiveTags,integrationUuid:$integrationUuid,integrationName:$integrationName,integrationActiveInbounds:$integrationActiveInbounds},xray:{inboundUuid:$inboundUuid,inboundTag:$inboundTag,tproxyPort:$tproxyPort,outboundTag:$outboundTag,outboundProtocol:$outboundProtocol,directTag:$directTag,routeMode:$routeMode},awg:{interface:"awg0",port:($awgPort|tonumber),subnet:$awgSubnet,preset:$awgPreset,serverName:$awgServerName,moduleVersion:$awgModuleVersion,preinstalled:$awgPreinstalled,installedByModule:false},host:{interface:"awg0",mark:$hostMark,table:$hostTable,priority:$hostPriority,ufwRuleAdded:false,previousIpForward:$previousIpForward,previousSrcValidMark:$previousSrcValidMark},docker:{composeFile:$dockerComposeFile,service:$dockerService,netAdminAdded:$dockerCapAdded}}') || {
+        '{version:4,createdAt:$createdAt,enabled:false,bootstrapPending:($awgPreinstalled|not),node:{uuid:$nodeUuid,name:$nodeName,address:$nodeAddress},profile:{originalUuid:$originalUuid,originalName:$originalName,originalConfig:$originalConfig,originalActiveInbounds:$originalActiveInbounds,originalActiveTags:$originalActiveTags,integrationUuid:$integrationUuid,integrationName:$integrationName,integrationActiveInbounds:$integrationActiveInbounds},xray:{inboundUuid:$inboundUuid,inboundTag:$inboundTag,tproxyPort:$tproxyPort,outboundTag:$outboundTag,outboundProtocol:$outboundProtocol,directTag:$directTag,routeMode:$routeMode},awg:{interface:"awg0",port:($awgPort|tonumber),subnet:$awgSubnet,preset:$awgPreset,serverName:$awgServerName,endpoint:$awgEndpoint,moduleVersion:$awgModuleVersion,preinstalled:$awgPreinstalled,installedByModule:false},host:{interface:"awg0",mark:$hostMark,table:$hostTable,priority:$hostPriority,ufwRuleAdded:false,previousIpForward:$previousIpForward,previousSrcValidMark:$previousSrcValidMark},docker:{composeFile:$dockerComposeFile,service:$dockerService,netAdminAdded:$dockerCapAdded}}') || {
         awgr_restore_original_profile "$(jq -n --arg node "$node_uuid" --arg profile "$original_profile_uuid" --argjson inbounds "$original_active_inbounds" '{node:{uuid:$node},profile:{originalUuid:$profile,originalActiveInbounds:$inbounds}}')" >/dev/null 2>&1 || true
         awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
         awgr_rollback_node_net_admin >/dev/null 2>&1 || true
@@ -1401,7 +1513,7 @@ PYNET
             return 1
         fi
     else
-        if ! awgr_write_bootstrap_env "$awg_port" "$awg_subnet" "$awg_preset" "$awg_server_name" \
+        if ! awgr_write_bootstrap_env "$awg_port" "$awg_subnet" "$awg_preset" "$awg_server_name" "$awg_endpoint" \
             || ! systemctl enable remnawave-awg3-bootstrap.service >/dev/null 2>&1 \
             || ! systemctl start --no-block remnawave-awg3-bootstrap.service; then
             awgr_remove_ufw_rule "$awg_port" "$AWGR_UFW_RULE_ADDED"
@@ -1418,7 +1530,8 @@ PYNET
         awgr_info "${LANG[AWGR_BOOTSTRAP_STARTED]}"
     fi
 
-    printf "${LANG[AWGR_SUMMARY]}\n" "$node_name" "$outbound_tag" "$route_mode" "$awg_port" "$awg_subnet" "$tproxy_port"
+    local endpoint_display="${awg_endpoint:-${LANG[AWGR_ENDPOINT_AUTO_VALUE]}}"
+    printf "${LANG[AWGR_SUMMARY]}\n" "$node_name" "$outbound_tag" "$route_mode" "$awg_port" "$awg_subnet" "$endpoint_display" "$tproxy_port"
 }
 
 amneziawg_remnawave_status() {
@@ -1433,6 +1546,9 @@ amneziawg_remnawave_status() {
     printf "${LANG[AWGR_STATUS_NODE]}\n" "$(echo "$state" | jq -r '.node.name')" "$(echo "$state" | jq -r '.node.uuid')"
     printf "${LANG[AWGR_STATUS_ROUTE]}\n" "$(echo "$state" | jq -r '.xray.outboundTag')" "$(echo "$state" | jq -r '.xray.routeMode')"
     printf "${LANG[AWGR_STATUS_PORTS]}\n" "$(echo "$state" | jq -r '.awg.port')" "$(echo "$state" | jq -r '.xray.tproxyPort')"
+    local saved_endpoint
+    saved_endpoint=$(echo "$state" | jq -r '.awg.endpoint // empty')
+    printf "${LANG[AWGR_STATUS_ENDPOINT]}\n" "${saved_endpoint:-${LANG[AWGR_ENDPOINT_AUTO_VALUE]}}"
     local module_version
     module_version="$(awgr_module_version)"
     if [[ "$module_version" == 3.* ]]; then
