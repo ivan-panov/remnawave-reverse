@@ -1,8 +1,6 @@
 #!/bin/bash
 # Pinned launcher for bivlked/amneziawg-installer v5.24.0.
 # Commit: 2c86966f59d54c0fd0bcf66639c537558a1a0c25
-# On x86_64 with Linux >= 6.7 this upstream installer installs the
-# AmneziaWG 3.0 kernel module from the official Amnezia PPA.
 set -euo pipefail
 
 UPSTREAM_VERSION="5.24.0"
@@ -32,5 +30,4 @@ grep -Fq 'AWG_BRANCH="${AWG_BRANCH:-v${SCRIPT_VERSION}}"' "$tmp" || {
     exit 1
 }
 
-# Pin helper scripts (awg_common/manage) to the same immutable commit.
 AWG_BRANCH="$UPSTREAM_COMMIT" bash "$tmp" "$@"

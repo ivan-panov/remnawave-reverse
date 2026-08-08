@@ -1,3 +1,8 @@
+# 3.0.3
+
+- AmneziaWG 3.0 module now recreates the pinned v5.24.0 launcher automatically when `/usr/local/remnawave_reverse/vendor/amneziawg-installer/install_amneziawg.sh` is missing after an in-place updater run or a raw-script installation.
+- Keeps the immutable upstream commit pin and existing optional AWG client endpoint domain support.
+
 # 3.0.2
 
 - Версия установщика повышена до `3.0.2`, чтобы встроенная проверка обновлений корректно отличала новую сборку от `3.0.1`.

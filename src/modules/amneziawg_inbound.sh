@@ -16,6 +16,62 @@ AWGR_BOOTSTRAP_UNIT="/etc/systemd/system/remnawave-awg3-bootstrap.service"
 AWGR_SYSCTL_FILE="/etc/sysctl.d/99-remnawave-awg3-tproxy.conf"
 AWGR_AWG_CONFIG="/root/awg/awgsetup_cfg.init"
 AWGR_AWG_SERVER_CONFIG="/etc/amnezia/amneziawg/awg0.conf"
+AWGR_UPSTREAM_VERSION="5.24.0"
+AWGR_UPSTREAM_COMMIT="2c86966f59d54c0fd0bcf66639c537558a1a0c25"
+
+# The menu script can be updated from GitHub without copying the repository's
+# vendor/ directory.  Keep the pinned launcher self-healing so menu item 13
+# works after both a fresh `bash <(curl ...)` install and an in-place update.
+awgr_ensure_pinned_installer() {
+    if [ -x "$AWGR_INSTALLER" ] \
+        && grep -Fq "UPSTREAM_VERSION=\"${AWGR_UPSTREAM_VERSION}\"" "$AWGR_INSTALLER" 2>/dev/null \
+        && grep -Fq "UPSTREAM_COMMIT=\"${AWGR_UPSTREAM_COMMIT}\"" "$AWGR_INSTALLER" 2>/dev/null; then
+        return 0
+    fi
+
+    mkdir -p "$AWGR_VENDOR_DIR" || return 1
+    local tmp="${AWGR_INSTALLER}.tmp.$$"
+    umask 077
+    cat > "$tmp" <<'AWGR_PINNED_LAUNCHER'
+#!/bin/bash
+# Pinned launcher for bivlked/amneziawg-installer v5.24.0.
+# Commit: 2c86966f59d54c0fd0bcf66639c537558a1a0c25
+set -euo pipefail
+
+UPSTREAM_VERSION="5.24.0"
+UPSTREAM_COMMIT="2c86966f59d54c0fd0bcf66639c537558a1a0c25"
+UPSTREAM_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/${UPSTREAM_COMMIT}/install_amneziawg.sh"
+
+tmp="$(mktemp /tmp/remnawave-amneziawg-installer.XXXXXX.sh)"
+cleanup() { rm -f "$tmp"; }
+trap cleanup EXIT INT TERM
+
+curl -fL \
+    --proto '=https' \
+    --tlsv1.2 \
+    --connect-timeout 20 \
+    --retry 5 \
+    --retry-delay 2 \
+    -o "$tmp" \
+    "$UPSTREAM_URL"
+
+chmod 700 "$tmp"
+grep -Fq 'SCRIPT_VERSION="5.24.0"' "$tmp" || {
+    echo "Ошибка: загруженный AmneziaWG Installer не соответствует v${UPSTREAM_VERSION}." >&2
+    exit 1
+}
+grep -Fq 'AWG_BRANCH="${AWG_BRANCH:-v${SCRIPT_VERSION}}"' "$tmp" || {
+    echo "Ошибка: структура upstream-инсталлера неожиданно изменилась." >&2
+    exit 1
+}
+
+AWG_BRANCH="$UPSTREAM_COMMIT" bash "$tmp" "$@"
+AWGR_PINNED_LAUNCHER
+
+    chmod 700 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$AWGR_INSTALLER" || { rm -f "$tmp"; return 1; }
+    return 0
+}
 
 awgr_error() { echo -e "${COLOR_RED}$*${COLOR_RESET}"; }
 awgr_warn()  { echo -e "${COLOR_YELLOW}$*${COLOR_RESET}"; }
@@ -219,7 +275,7 @@ awgr_requirements() {
         return 1
     fi
 
-    if [ ! -x "$AWGR_INSTALLER" ]; then
+    if ! awgr_ensure_pinned_installer; then
         awgr_error "${LANG[AWGR_VENDOR_MISSING]}: $AWGR_INSTALLER"
         return 1
     fi

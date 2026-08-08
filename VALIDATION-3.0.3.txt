@@ -1,0 +1,8 @@
+Remnawave Reverse 3.0.3 validation
+- Based on 3.0.2 (Subpage API token hotfix + optional AWG endpoint domain).
+- SCRIPT_VERSION: 3.0.3.
+- All shell files pass `bash -n`.
+- AWG module self-heals a missing pinned launcher under /usr/local/remnawave_reverse/vendor/amneziawg-installer/.
+- Self-generated launcher remains pinned to bivlked/amneziawg-installer v5.24.0 commit 2c86966f59d54c0fd0bcf66639c537558a1a0c25.
+- Packaged vendor launcher is present and executable.
+- No live DKMS installation, reboot, or Remnawave API mutation was performed in validation.

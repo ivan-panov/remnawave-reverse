@@ -3,6 +3,7 @@
 <strong>English</strong>
 </p>
 
+---
 
 > [!CAUTION]
 > **This repository is an educational example for learning NGINX/Caddy, reverse proxies, Xray and network security basics. It is not an official Remnawave installer. Review the code, make backups and test on a non-production VPS before use.**
