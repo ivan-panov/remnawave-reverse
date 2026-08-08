@@ -1,0 +1,18 @@
+Remnawave Reverse 3.0.13 validation
+Date: 2026-08-08 UTC
+
+VLESS cascade / Remnawave Panel v3 fixes validated:
+- SCRIPT_VERSION=3.0.13.
+- Service user creation does not send the removed custom account uuid field.
+- Service account is resolved through GET /api/users/by-username/{username}.
+- Numeric Remnawave v3 userId is stored in state v4 and used for DELETE /api/users/{userId}.
+- VLESS UUID is kept separately and used only as the VLESS credential in the entry-node outbound.
+- Internal Squad membership is verified after user creation.
+- Missing membership is repaired via POST /api/internal-squads/{uuid}/bulk-actions/add-many-users with numeric userIds.
+- Empty 202 response from the asynchronous membership endpoint is accepted and verified by polling the user.
+- Legacy state removal keeps fallback to service.userUuid.
+
+Tests:
+PASS_V3_USER_ID_AND_SQUAD
+PASS_STATIC_V3_GUARDS
+PASS bash -n on all 20 shell files
