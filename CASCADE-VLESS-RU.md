@@ -31,7 +31,7 @@
 Распакуйте актуальный архив и выполните:
 
 ```bash
-cd remnawave-reverse-3.0.10
+cd remnawave-reverse-3.0.11
 chmod +x install_remnawave.sh
 sudo ./install_remnawave.sh
 ```

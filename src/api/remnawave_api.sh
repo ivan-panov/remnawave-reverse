@@ -10,7 +10,7 @@ make_api_request() {
     local headers=(
         -H "Authorization: Bearer $token"
         -H "Content-Type: application/json"
-        -H "X-Forwarded-For: ${url#http://}"
+        -H "X-Forwarded-For: 127.0.0.1"
         -H "X-Forwarded-Proto: https"
         -H "X-Remnawave-Client-Type: browser"
     )

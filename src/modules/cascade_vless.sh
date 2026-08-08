@@ -179,19 +179,63 @@ cascade_apply_profile_snapshot() {
     CASCADE_APPLIED_PROFILE_RESPONSE="$profile_response"
 }
 
+cascade_verify_profile_assignment() {
+    local node_uuid="$1"
+    local profile_uuid="$2"
+    local inbound_uuids="$3"
+    local attempt node_response current_profile current_inbounds expected actual
+
+    expected=$(jq -c 'map(select(type == "string" and length > 0)) | unique | sort' <<< "$inbound_uuids") || return 1
+
+    # The bulk profile-modification endpoint may complete asynchronously and may
+    # answer with HTTP 204 (empty body). Verify the state instead of treating an
+    # empty response as an error.
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        node_response=$(cascade_get_node "$node_uuid")
+        if cascade_response_ok "$node_response"; then
+            current_profile=$(jq -r '.response.configProfile.activeConfigProfileUuid // empty' <<< "$node_response")
+            current_inbounds=$(jq -c '[.response.configProfile.activeInbounds[]?.uuid] | map(select(type == "string" and length > 0)) | unique | sort' <<< "$node_response")
+            if [ "$current_profile" = "$profile_uuid" ]; then
+                actual="$current_inbounds"
+                if jq -e --argjson expected "$expected" --argjson actual "$actual" '$expected == $actual' >/dev/null 2>&1 <<< '{}'; then
+                    return 0
+                fi
+            fi
+        fi
+        sleep 0.25
+    done
+
+    return 1
+}
+
 cascade_assign_profile() {
     local node_uuid="$1"
     local profile_uuid="$2"
     local inbound_uuids="$3"
-    local payload
+    local payload response
+
     payload=$(jq -n \
         --arg node "$node_uuid" \
         --arg profile "$profile_uuid" \
         --argjson inbounds "$inbound_uuids" \
         '{uuids:[$node], configProfile:{activeConfigProfileUuid:$profile, activeInbounds:$inbounds}}') || return 1
-    local response
+
     response=$(cascade_api POST "/api/nodes/bulk-actions/profile-modification" "$payload")
-    cascade_response_ok "$response"
+
+    # Some Remnawave versions return JSON here, while others return 204 No
+    # Content. A non-empty API error is still fatal. For an empty/success-shaped
+    # response, verify the node's actual assignment before continuing.
+    if [ -n "$response" ] && ! cascade_response_ok "$response"; then
+        cascade_error "Remnawave profile-modification API: $response"
+        return 1
+    fi
+
+    if cascade_verify_profile_assignment "$node_uuid" "$profile_uuid" "$inbound_uuids"; then
+        return 0
+    fi
+
+    cascade_error "Remnawave profile-modification was not confirmed on node $node_uuid."
+    return 1
 }
 
 cascade_restart_node() {
