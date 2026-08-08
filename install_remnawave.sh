@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="3.0.5"
+SCRIPT_VERSION="3.0.6"
 CUSTOM_BUILD=false
 
 # Repository used for installation and self-updates. It can be overridden for
@@ -543,7 +543,7 @@ manage_install() {
                     load_api_module
                     if [ ! -f "${DIR_REMNAWAVE}install_packages" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
                         install_packages || {
-                            echo -e "${COLOR_RED}${LANG[ERROR_INSTALL_DOCKER]}${COLOR_RESET}"
+                            echo -e "${COLOR_RED}${LANG[ERROR_SYSTEM_PREPARE]}${COLOR_RESET}"
                             log_clear
                             exit 1
                         }
@@ -555,7 +555,7 @@ manage_install() {
                     load_api_module
                     if [ ! -f "${DIR_REMNAWAVE}install_packages" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
                         install_packages || {
-                            echo -e "${COLOR_RED}${LANG[ERROR_INSTALL_DOCKER]}${COLOR_RESET}"
+                            echo -e "${COLOR_RED}${LANG[ERROR_SYSTEM_PREPARE]}${COLOR_RESET}"
                             log_clear
                             exit 1
                         }
@@ -587,7 +587,7 @@ manage_install() {
                     load_api_module
                     if [ ! -f "${DIR_REMNAWAVE}install_packages" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
                         install_packages || {
-                            echo -e "${COLOR_RED}${LANG[ERROR_INSTALL_DOCKER]}${COLOR_RESET}"
+                            echo -e "${COLOR_RED}${LANG[ERROR_SYSTEM_PREPARE]}${COLOR_RESET}"
                             log_clear
                             exit 1
                         }
@@ -599,7 +599,7 @@ manage_install() {
                     load_api_module
                     if [ ! -f "${DIR_REMNAWAVE}install_packages" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
                         install_packages || {
-                            echo -e "${COLOR_RED}${LANG[ERROR_INSTALL_DOCKER]}${COLOR_RESET}"
+                            echo -e "${COLOR_RED}${LANG[ERROR_SYSTEM_PREPARE]}${COLOR_RESET}"
                             log_clear
                             exit 1
                         }
@@ -636,7 +636,7 @@ manage_install() {
                     load_install_node_module
                     if [ ! -f "${DIR_REMNAWAVE}install_packages" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
                         install_packages || {
-                            echo -e "${COLOR_RED}${LANG[ERROR_INSTALL_DOCKER]}${COLOR_RESET}"
+                            echo -e "${COLOR_RED}${LANG[ERROR_SYSTEM_PREPARE]}${COLOR_RESET}"
                             log_clear
                             exit 1
                         }
@@ -647,7 +647,7 @@ manage_install() {
                     load_caddy_node_module
                     if [ ! -f "${DIR_REMNAWAVE}install_packages" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
                         install_packages || {
-                            echo -e "${COLOR_RED}${LANG[ERROR_INSTALL_DOCKER]}${COLOR_RESET}"
+                            echo -e "${COLOR_RED}${LANG[ERROR_SYSTEM_PREPARE]}${COLOR_RESET}"
                             log_clear
                             exit 1
                         }
@@ -1399,6 +1399,68 @@ ensure_docker_ready() {
     install_docker_official_apt
 }
 
+
+ufw_ipv6_available() {
+    # UFW uses ip6tables when IPV6=yes. If IPv6 is disabled at kernel/sysctl level,
+    # enabling UFW may fail with the unhelpful "ERROR: problem running" message.
+    [ -e /proc/net/if_inet6 ] || return 1
+
+    local disabled_all disabled_default
+    disabled_all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)
+    disabled_default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo 0)
+
+    [ "$disabled_all" != "1" ] && [ "$disabled_default" != "1" ]
+}
+
+configure_ufw_safely() {
+    command -v ufw >/dev/null 2>&1 || {
+        echo -e "${COLOR_RED}${LANG[ERROR_CONFIGURE_UFW]}: ufw command not found${COLOR_RESET}" >&2
+        return 1
+    }
+
+    # Keep /etc/default/ufw consistent with the actual kernel IPv6 state.
+    # This is especially important on VPS hosts where IPv6 was deliberately disabled.
+    if ! ufw_ipv6_available; then
+        if [ -f /etc/default/ufw ]; then
+            [ -e /etc/default/ufw.remnawave.bak ] || cp -a /etc/default/ufw /etc/default/ufw.remnawave.bak 2>/dev/null || true
+            if grep -qE '^[[:space:]]*IPV6=' /etc/default/ufw; then
+                sed -i -E 's/^[[:space:]]*IPV6=.*/IPV6=no/' /etc/default/ufw
+            else
+                printf '\nIPV6=no\n' >> /etc/default/ufw
+            fi
+        fi
+        echo -e "${COLOR_YELLOW}${LANG[UFW_IPV6_DISABLED]}${COLOR_RESET}"
+    fi
+
+    local ufw_output
+    if ! ufw_output=$(ufw allow 22/tcp comment 'SSH' 2>&1); then
+        printf '%s\n' "$ufw_output" >&2
+        return 1
+    fi
+    if ! ufw_output=$(ufw allow 443/tcp comment 'HTTPS' 2>&1); then
+        printf '%s\n' "$ufw_output" >&2
+        return 1
+    fi
+
+    if LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
+        if ! ufw_output=$(ufw reload 2>&1); then
+            printf '%s\n' "$ufw_output" >&2
+            return 1
+        fi
+    else
+        if ! ufw_output=$(ufw --force enable 2>&1); then
+            printf '%s\n' "$ufw_output" >&2
+            echo -e "${COLOR_YELLOW}${LANG[UFW_DIAGNOSTIC_HINT]}${COLOR_RESET}" >&2
+            LC_ALL=C ufw status verbose >&2 2>/dev/null || true
+            iptables --version >&2 2>/dev/null || true
+            ip6tables --version >&2 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 install_packages() {
     echo -e "${COLOR_YELLOW}${LANG[INSTALL_PACKAGES]}${COLOR_RESET}"
 
@@ -1449,7 +1511,7 @@ install_packages() {
     sysctl -p >/dev/null
 
     # UFW
-    if ! ufw allow 22/tcp comment 'SSH' || ! ufw allow 443/tcp comment 'HTTPS' || ! ufw --force enable; then
+    if ! configure_ufw_safely; then
         echo -e "${COLOR_RED}${LANG[ERROR_CONFIGURE_UFW]}${COLOR_RESET}" >&2
         return 1
     fi
