@@ -225,7 +225,7 @@ awgr_legacy_runtime_exists() {
 awgr_require_current_state_schema() {
     local version
     version="$(awgr_state_schema_version)"
-    if [ "$version" != "4" ]; then
+    if [ "$version" != "5" ]; then
         awgr_error "$(printf "${LANG[AWGR_LEGACY_STATE_DETECTED]}" "$version")"
         return 1
     fi
@@ -749,6 +749,62 @@ awgr_create_profile() {
     awgr_api POST "/api/config-profiles" "$payload"
 }
 
+# Remnawave requires inbound tags to be globally unique.  Therefore an exact
+# clone of an active profile cannot be created while the original profile still
+# exists.  AWG integration updates the selected profile in place and keeps the
+# original JSON in state.json for rollback.
+#
+# Remnawave API revisions have exposed profile update in two compatible forms:
+#   PATCH /api/config-profiles        {uuid,name,config}
+#   PATCH /api/config-profiles/{uuid} {name,config}
+# Try the collection form first (used by the API contract bundled with older
+# panels), then fall back to the UUID path used by newer SDKs.
+awgr_update_profile() {
+    local uuid="$1"
+    local name="$2"
+    local config="$3"
+    local payload response payload_by_uuid response_by_uuid
+
+    payload=$(jq -n --arg uuid "$uuid" --arg name "$name" --argjson config "$config"         '{uuid:$uuid,name:$name,config:$config}') || return 1
+    response=$(awgr_api PATCH "/api/config-profiles" "$payload")
+    if awgr_response_ok "$response"; then
+        printf '%s\n' "$response"
+        return 0
+    fi
+
+    payload_by_uuid=$(jq -n --arg name "$name" --argjson config "$config"         '{name:$name,config:$config}') || return 1
+    response_by_uuid=$(awgr_api PATCH "/api/config-profiles/$uuid" "$payload_by_uuid")
+    if awgr_response_ok "$response_by_uuid"; then
+        printf '%s\n' "$response_by_uuid"
+        return 0
+    fi
+
+    # Return the most useful API body to the caller for diagnostics.
+    if [ -n "$response_by_uuid" ]; then
+        printf '%s\n' "$response_by_uuid"
+    else
+        printf '%s\n' "$response"
+    fi
+    return 1
+}
+
+awgr_restore_profile_snapshot() {
+    local node_uuid="$1"
+    local profile_uuid="$2"
+    local profile_name="$3"
+    local config="$4"
+    local active_tags="$5"
+    local update_response profile_response active_inbounds
+
+    update_response=$(awgr_update_profile "$profile_uuid" "$profile_name" "$config") || return 1
+    awgr_response_ok "$update_response" || return 1
+    profile_response=$(awgr_get_profile "$profile_uuid")
+    awgr_response_ok "$profile_response" || return 1
+    active_inbounds=$(awgr_map_tags_to_uuids "$profile_response" "$active_tags")
+    jq -e 'type == "array"' >/dev/null 2>&1 <<< "$active_inbounds" || return 1
+    awgr_assign_profile "$node_uuid" "$profile_uuid" "$active_inbounds"
+}
+
 awgr_delete_profile() {
     local uuid="$1"
     [ -n "$uuid" ] || return 0
@@ -1232,10 +1288,9 @@ awgr_remove_runtime() {
 
 awgr_restore_original_profile() {
     local state="$1"
-    local node_uuid original_uuid original_inbounds original_tags original_name original_config
+    local node_uuid original_uuid original_tags original_name original_config
     node_uuid=$(echo "$state" | jq -r '.node.uuid')
     original_uuid=$(echo "$state" | jq -r '.profile.originalUuid')
-    original_inbounds=$(echo "$state" | jq -c '.profile.originalActiveInbounds')
     original_tags=$(echo "$state" | jq -c '.profile.originalActiveTags')
     original_name=$(echo "$state" | jq -r '.profile.originalName')
     original_config=$(echo "$state" | jq -c '.profile.originalConfig')
@@ -1243,7 +1298,9 @@ awgr_restore_original_profile() {
     local profile_response
     profile_response=$(awgr_get_profile "$original_uuid")
     if awgr_response_ok "$profile_response"; then
-        awgr_assign_profile "$node_uuid" "$original_uuid" "$original_inbounds"
+        # Integration is applied in place. Restore the saved JSON first, then
+        # remap active inbound tags to the UUIDs returned by Remnawave.
+        awgr_restore_profile_snapshot "$node_uuid" "$original_uuid" "$original_name" "$original_config" "$original_tags"
         return $?
     fi
 
@@ -1258,8 +1315,8 @@ awgr_restore_original_profile() {
     awgr_assign_profile "$node_uuid" "$recovered_uuid" "$recovered_inbounds" || return 1
 
     local tmp="${AWGR_STATE_FILE}.tmp.$$"
-    if ! jq --arg uuid "$recovered_uuid" '.profile.originalUuid=$uuid' "$AWGR_STATE_FILE" > "$tmp" \
-        || ! jq -e 'type == "object" and .version == 4' "$tmp" >/dev/null 2>&1 \
+    if ! jq --arg uuid "$recovered_uuid" --arg name "$recovered_name"         '.profile.originalUuid=$uuid | .profile.integrationUuid=$uuid | .profile.originalName=$name | .profile.integrationName=$name'         "$AWGR_STATE_FILE" > "$tmp" \
+        || ! jq -e 'type == "object" and .version == 5' "$tmp" >/dev/null 2>&1 \
         || ! chmod 600 "$tmp" \
         || ! mv -f "$tmp" "$AWGR_STATE_FILE"; then
         rm -f "$tmp"
@@ -1272,7 +1329,7 @@ create_amneziawg_remnawave_integration() {
     awgr_requirements || return 1
 
     if [ -e "$AWGR_STATE_FILE" ]; then
-        if [ "$(awgr_state_schema_version)" != "4" ]; then
+        if [ "$(awgr_state_schema_version)" != "5" ]; then
             awgr_error "$(printf "${LANG[AWGR_LEGACY_STATE_DETECTED]}" "$(awgr_state_schema_version)")"
         else
             awgr_warn "${LANG[AWGR_ALREADY_EXISTS]}"
@@ -1466,34 +1523,47 @@ PYNET
         return 1
     fi
 
-    local new_profile_name new_profile_response new_profile_uuid new_inbound_uuid new_active_inbounds
-    new_profile_name="$(awgr_safe_name "${original_name}-AWG3-$(date +%Y%m%d%H%M%S)")"
-    new_profile_response=$(awgr_create_profile "$new_profile_name" "$new_config")
-    if ! awgr_response_ok "$new_profile_response"; then
+    local new_profile_name new_profile_response new_profile_uuid new_inbound_uuid new_active_inbounds update_response
+    # Do NOT clone the profile: Remnawave enforces globally unique inbound tags,
+    # so cloning StealConfig would duplicate the existing Steal tag and return
+    # HTTP 409.  Apply AWG3_TPROXY_IN to the selected profile in place instead.
+    new_profile_name="$original_name"
+    new_profile_uuid="$original_profile_uuid"
+    update_response=$(awgr_update_profile "$original_profile_uuid" "$original_name" "$new_config")
+    if ! awgr_response_ok "$update_response"; then
         awgr_rollback_node_net_admin >/dev/null 2>&1 || true
-        awgr_error "${LANG[AWGR_PROFILE_CREATE_ERROR]}"
+        awgr_error "${LANG[AWGR_PROFILE_UPDATE_ERROR]}"
+        [ -n "$update_response" ] && awgr_error "API: $update_response"
         return 1
     fi
-    new_profile_uuid=$(echo "$new_profile_response" | jq -r '.response.uuid // empty')
-    new_inbound_uuid=$(echo "$new_profile_response" | jq -r --arg tag "$inbound_tag" '.response.inbounds[]? | select(.tag == $tag) | .uuid' | head -n1)
-    [ -n "$new_profile_uuid" ] && [ -n "$new_inbound_uuid" ] || {
-        awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
+
+    new_profile_response=$(awgr_get_profile "$original_profile_uuid")
+    if ! awgr_response_ok "$new_profile_response"; then
+        awgr_restore_profile_snapshot "$node_uuid" "$original_profile_uuid" "$original_name" "$original_config" "$original_active_tags" >/dev/null 2>&1 || true
         awgr_rollback_node_net_admin >/dev/null 2>&1 || true
-        awgr_error "${LANG[AWGR_PROFILE_CREATE_ERROR]}"
+        awgr_error "${LANG[AWGR_PROFILE_UPDATE_ERROR]}"
+        return 1
+    fi
+
+    new_inbound_uuid=$(echo "$new_profile_response" | jq -r --arg tag "$inbound_tag" '.response.inbounds[]? | select(.tag == $tag) | .uuid' | head -n1)
+    [ -n "$new_inbound_uuid" ] || {
+        awgr_restore_profile_snapshot "$node_uuid" "$original_profile_uuid" "$original_name" "$original_config" "$original_active_tags" >/dev/null 2>&1 || true
+        awgr_rollback_node_net_admin >/dev/null 2>&1 || true
+        awgr_error "${LANG[AWGR_PROFILE_UPDATE_ERROR]}"
         return 1
     }
 
     new_active_inbounds=$(awgr_map_tags_to_uuids "$new_profile_response" "$original_active_tags")
     if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$new_active_inbounds"; then
-        awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
+        awgr_restore_profile_snapshot "$node_uuid" "$original_profile_uuid" "$original_name" "$original_config" "$original_active_tags" >/dev/null 2>&1 || true
         awgr_rollback_node_net_admin >/dev/null 2>&1 || true
-        awgr_error "${LANG[AWGR_PROFILE_CREATE_ERROR]}"
+        awgr_error "${LANG[AWGR_PROFILE_UPDATE_ERROR]}"
         return 1
     fi
     new_active_inbounds=$(jq -c --arg uuid "$new_inbound_uuid" '. + [$uuid] | map(select(length > 0)) | unique' <<< "$new_active_inbounds")
 
     if ! awgr_assign_profile "$node_uuid" "$new_profile_uuid" "$new_active_inbounds"; then
-        awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
+        awgr_restore_profile_snapshot "$node_uuid" "$original_profile_uuid" "$original_name" "$original_config" "$original_active_tags" >/dev/null 2>&1 || true
         awgr_rollback_node_net_admin >/dev/null 2>&1 || true
         awgr_error "${LANG[AWGR_PROFILE_ASSIGN_ERROR]}"
         return 1
@@ -1510,7 +1580,7 @@ PYNET
         --arg nodeUuid "$node_uuid" --arg nodeName "$node_name" --arg nodeAddress "$node_address" \
         --arg originalUuid "$original_profile_uuid" --arg originalName "$original_name" --argjson originalConfig "$original_config" \
         --argjson originalActiveInbounds "$original_active_inbounds" --argjson originalActiveTags "$original_active_tags" \
-        --arg integrationUuid "$new_profile_uuid" --arg integrationName "$new_profile_name" --argjson integrationActiveInbounds "$new_active_inbounds" \
+        --arg integrationUuid "$new_profile_uuid" --arg integrationName "$new_profile_name" --argjson integrationConfig "$new_config" --argjson integrationActiveInbounds "$new_active_inbounds" \
         --arg inboundUuid "$new_inbound_uuid" --arg inboundTag "$inbound_tag" --argjson tproxyPort "$tproxy_port" \
         --arg outboundTag "$outbound_tag" --arg outboundProtocol "$outbound_protocol" --arg directTag "$direct_tag" --arg routeMode "$route_mode" \
         --arg awgPort "$awg_port" --arg awgSubnet "$awg_subnet" --arg awgPreset "$awg_preset" --arg awgServerName "$awg_server_name" --arg awgEndpoint "$awg_endpoint" \
@@ -1518,9 +1588,8 @@ PYNET
         --arg hostMark "$AWGR_SELECTED_MARK" --argjson hostTable "$AWGR_SELECTED_TABLE" --argjson hostPriority "$AWGR_SELECTED_PRIORITY" \
         --argjson previousIpForward "$previous_ip_forward" --argjson previousSrcValidMark "$previous_src_valid_mark" \
         --arg dockerComposeFile "$AWGR_DOCKER_COMPOSE_FILE" --arg dockerService "$AWGR_DOCKER_SERVICE" --argjson dockerCapAdded "$AWGR_DOCKER_CAP_ADDED" \
-        '{version:4,createdAt:$createdAt,enabled:false,bootstrapPending:($awgPreinstalled|not),node:{uuid:$nodeUuid,name:$nodeName,address:$nodeAddress},profile:{originalUuid:$originalUuid,originalName:$originalName,originalConfig:$originalConfig,originalActiveInbounds:$originalActiveInbounds,originalActiveTags:$originalActiveTags,integrationUuid:$integrationUuid,integrationName:$integrationName,integrationActiveInbounds:$integrationActiveInbounds},xray:{inboundUuid:$inboundUuid,inboundTag:$inboundTag,tproxyPort:$tproxyPort,outboundTag:$outboundTag,outboundProtocol:$outboundProtocol,directTag:$directTag,routeMode:$routeMode},awg:{interface:"awg0",port:($awgPort|tonumber),subnet:$awgSubnet,preset:$awgPreset,serverName:$awgServerName,endpoint:$awgEndpoint,moduleVersion:$awgModuleVersion,preinstalled:$awgPreinstalled,installedByModule:false},host:{interface:"awg0",mark:$hostMark,table:$hostTable,priority:$hostPriority,ufwRuleAdded:false,previousIpForward:$previousIpForward,previousSrcValidMark:$previousSrcValidMark},docker:{composeFile:$dockerComposeFile,service:$dockerService,netAdminAdded:$dockerCapAdded}}') || {
-        awgr_restore_original_profile "$(jq -n --arg node "$node_uuid" --arg profile "$original_profile_uuid" --argjson inbounds "$original_active_inbounds" '{node:{uuid:$node},profile:{originalUuid:$profile,originalActiveInbounds:$inbounds}}')" >/dev/null 2>&1 || true
-        awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
+        '{version:5,createdAt:$createdAt,enabled:false,bootstrapPending:($awgPreinstalled|not),node:{uuid:$nodeUuid,name:$nodeName,address:$nodeAddress},profile:{mode:"in_place",originalUuid:$originalUuid,originalName:$originalName,originalConfig:$originalConfig,originalActiveInbounds:$originalActiveInbounds,originalActiveTags:$originalActiveTags,integrationUuid:$integrationUuid,integrationName:$integrationName,integrationConfig:$integrationConfig,integrationActiveInbounds:$integrationActiveInbounds},xray:{inboundUuid:$inboundUuid,inboundTag:$inboundTag,tproxyPort:$tproxyPort,outboundTag:$outboundTag,outboundProtocol:$outboundProtocol,directTag:$directTag,routeMode:$routeMode},awg:{interface:"awg0",port:($awgPort|tonumber),subnet:$awgSubnet,preset:$awgPreset,serverName:$awgServerName,endpoint:$awgEndpoint,moduleVersion:$awgModuleVersion,preinstalled:$awgPreinstalled,installedByModule:false},host:{interface:"awg0",mark:$hostMark,table:$hostTable,priority:$hostPriority,ufwRuleAdded:false,previousIpForward:$previousIpForward,previousSrcValidMark:$previousSrcValidMark},docker:{composeFile:$dockerComposeFile,service:$dockerService,netAdminAdded:$dockerCapAdded}}') || {
+        awgr_restore_profile_snapshot "$node_uuid" "$original_profile_uuid" "$original_name" "$original_config" "$original_active_tags" >/dev/null 2>&1 || true
         awgr_rollback_node_net_admin >/dev/null 2>&1 || true
         awgr_error "${LANG[AWGR_STATE_WRITE_ERROR]}"
         return 1
@@ -1529,12 +1598,11 @@ PYNET
     umask 077
     local state_tmp="${AWGR_STATE_FILE}.tmp.$$"
     if ! printf '%s\n' "$state" > "$state_tmp" \
-        || ! jq -e 'type == "object" and .version == 4' "$state_tmp" >/dev/null 2>&1 \
+        || ! jq -e 'type == "object" and .version == 5' "$state_tmp" >/dev/null 2>&1 \
         || ! chmod 600 "$state_tmp" \
         || ! mv -f "$state_tmp" "$AWGR_STATE_FILE"; then
         rm -f "$state_tmp"
         awgr_restore_original_profile "$state" >/dev/null 2>&1 || true
-        awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
         awgr_rollback_node_net_admin >/dev/null 2>&1 || true
         awgr_error "${LANG[AWGR_STATE_WRITE_ERROR]}"
         return 1
@@ -1543,7 +1611,6 @@ PYNET
     if ! awgr_write_tproxy_runtime; then
         awgr_remove_runtime "$state" "$([ "$awg_installed" = false ] && echo true || echo false)"
         awgr_restore_original_profile "$state" >/dev/null 2>&1 || true
-        awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
         rm -f "$AWGR_STATE_FILE"
         awgr_rollback_node_net_admin >/dev/null 2>&1 || true
         awgr_error "${LANG[AWGR_RUNTIME_ERROR]}"
@@ -1553,7 +1620,6 @@ PYNET
     if ! awgr_ensure_ufw_rule "$awg_port"; then
         awgr_remove_runtime "$state" "$([ "$awg_installed" = false ] && echo true || echo false)"
         awgr_restore_original_profile "$state" >/dev/null 2>&1 || true
-        awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
         rm -f "$AWGR_STATE_FILE"
         awgr_rollback_node_net_admin >/dev/null 2>&1 || true
         return 1
@@ -1568,8 +1634,7 @@ PYNET
             awgr_remove_ufw_rule "$awg_port" true
             awgr_remove_runtime "$state" "$([ "$awg_installed" = false ] && echo true || echo false)"
             awgr_restore_original_profile "$state" >/dev/null 2>&1 || true
-            awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
-            rm -f "$AWGR_STATE_FILE"
+                rm -f "$AWGR_STATE_FILE"
             awgr_rollback_node_net_admin >/dev/null 2>&1 || true
             awgr_error "${LANG[AWGR_STATE_WRITE_ERROR]}"
             return 1
@@ -1588,8 +1653,7 @@ PYNET
                 awgr_remove_ufw_rule "$awg_port" "$AWGR_UFW_RULE_ADDED"
                 awgr_remove_runtime "$state" false
                 awgr_restore_original_profile "$state" >/dev/null 2>&1 || true
-                awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
-                rm -f "$AWGR_STATE_FILE"
+                        rm -f "$AWGR_STATE_FILE"
                 awgr_rollback_node_net_admin >/dev/null 2>&1 || true
                 awgr_error "${LANG[AWGR_STATE_WRITE_ERROR]}"
                 return 1
@@ -1599,8 +1663,7 @@ PYNET
             awgr_remove_ufw_rule "$awg_port" "$AWGR_UFW_RULE_ADDED"
             awgr_remove_runtime "$state" false
             awgr_restore_original_profile "$state" >/dev/null 2>&1 || true
-            awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
-            rm -f "$AWGR_STATE_FILE"
+                rm -f "$AWGR_STATE_FILE"
             awgr_rollback_node_net_admin >/dev/null 2>&1 || true
             awgr_error "${LANG[AWGR_TPROXY_START_ERROR]}"
             return 1
@@ -1612,8 +1675,7 @@ PYNET
             awgr_remove_ufw_rule "$awg_port" "$AWGR_UFW_RULE_ADDED"
             awgr_remove_runtime "$state" true
             awgr_restore_original_profile "$state" >/dev/null 2>&1 || true
-            awgr_delete_profile "$new_profile_uuid" >/dev/null 2>&1 || true
-            rm -f "$AWGR_STATE_FILE"
+                rm -f "$AWGR_STATE_FILE"
             awgr_rollback_node_net_admin >/dev/null 2>&1 || true
             awgr_error "${LANG[AWGR_BOOTSTRAP_START_ERROR]}"
             return 1
@@ -1696,7 +1758,18 @@ amneziawg_remnawave_status() {
         expected_profile=$(echo "$state" | jq -r '.profile.integrationUuid')
         active_profile=$(echo "$node_response" | jq -r '.response.configProfile.activeConfigProfileUuid // empty' 2>/dev/null)
         if [ "$active_profile" = "$expected_profile" ]; then
-            awgr_ok "${LANG[AWGR_STATUS_PROFILE_OK]}"
+            if [ "$(echo "$state" | jq -r '.enabled')" = "true" ]; then
+                local active_profile_response expected_inbound_tag
+                active_profile_response=$(awgr_get_profile "$expected_profile")
+                expected_inbound_tag=$(echo "$state" | jq -r '.xray.inboundTag')
+                if awgr_response_ok "$active_profile_response"                     && echo "$active_profile_response" | jq -e --arg tag "$expected_inbound_tag" '.response.inbounds[]? | select(.tag == $tag)' >/dev/null 2>&1; then
+                    awgr_ok "${LANG[AWGR_STATUS_PROFILE_OK]}"
+                else
+                    awgr_warn "${LANG[AWGR_STATUS_PROFILE_MISMATCH]}"
+                fi
+            else
+                awgr_ok "${LANG[AWGR_STATUS_PROFILE_OK]}"
+            fi
         else
             awgr_warn "${LANG[AWGR_STATUS_PROFILE_MISMATCH]}"
         fi
@@ -1728,7 +1801,13 @@ disable_amneziawg_remnawave() {
         || ! mv -f "$tmp" "$AWGR_STATE_FILE"; then
         rm -f "$tmp"
         # Keep state and actual routing consistent by restoring the integration.
-        awgr_assign_profile "$(echo "$state" | jq -r '.node.uuid')" "$(echo "$state" | jq -r '.profile.integrationUuid')" "$(echo "$state" | jq -c '.profile.integrationActiveInbounds')" >/dev/null 2>&1 || true
+        awgr_update_profile "$(echo "$state" | jq -r '.profile.integrationUuid')" "$(echo "$state" | jq -r '.profile.integrationName')" "$(echo "$state" | jq -c '.profile.integrationConfig')" >/dev/null 2>&1 || true
+        local current_profile current_inbound current_inbounds
+        current_profile=$(awgr_get_profile "$(echo "$state" | jq -r '.profile.integrationUuid')")
+        current_inbound=$(echo "$current_profile" | jq -r --arg tag "$(echo "$state" | jq -r '.xray.inboundTag')" '.response.inbounds[]? | select(.tag == $tag) | .uuid' | head -n1)
+        current_inbounds=$(awgr_map_tags_to_uuids "$current_profile" "$(echo "$state" | jq -c '.profile.originalActiveTags')")
+        current_inbounds=$(jq -c --arg uuid "$current_inbound" '. + [$uuid] | map(select(length > 0)) | unique' <<< "$current_inbounds")
+        awgr_assign_profile "$(echo "$state" | jq -r '.node.uuid')" "$(echo "$state" | jq -r '.profile.integrationUuid')" "$current_inbounds" >/dev/null 2>&1 || true
         awgr_restart_node "$(echo "$state" | jq -r '.node.uuid')" >/dev/null 2>&1 || true
         awgr_write_tproxy_runtime >/dev/null 2>&1 || true
         systemctl enable --now remnawave-awg3-tproxy.service >/dev/null 2>&1 || true
@@ -1749,17 +1828,37 @@ enable_amneziawg_remnawave() {
         return 1
     fi
 
-    local state node profile inbounds
+    local state node profile integration_config original_tags inbound_tag inbounds
     state=$(cat "$AWGR_STATE_FILE")
     node=$(echo "$state" | jq -r '.node.uuid')
     profile=$(echo "$state" | jq -r '.profile.integrationUuid')
-    inbounds=$(echo "$state" | jq -c '.profile.integrationActiveInbounds')
+    integration_config=$(echo "$state" | jq -c '.profile.integrationConfig')
+    original_tags=$(echo "$state" | jq -c '.profile.originalActiveTags')
+    inbound_tag=$(echo "$state" | jq -r '.xray.inboundTag')
 
-    local profile_response
+    local update_response profile_response inbound_uuid
+    update_response=$(awgr_update_profile "$profile" "$(echo "$state" | jq -r '.profile.integrationName')" "$integration_config")
+    awgr_response_ok "$update_response" || { awgr_error "${LANG[AWGR_PROFILE_UPDATE_ERROR]}"; return 1; }
     profile_response=$(awgr_get_profile "$profile")
     awgr_response_ok "$profile_response" || { awgr_error "${LANG[AWGR_INTEGRATION_PROFILE_MISSING]}"; return 1; }
+    inbound_uuid=$(echo "$profile_response" | jq -r --arg tag "$inbound_tag" '.response.inbounds[]? | select(.tag == $tag) | .uuid' | head -n1)
+    [ -n "$inbound_uuid" ] || { awgr_error "${LANG[AWGR_PROFILE_UPDATE_ERROR]}"; return 1; }
+    inbounds=$(awgr_map_tags_to_uuids "$profile_response" "$original_tags")
+    jq -e 'type == "array"' >/dev/null 2>&1 <<< "$inbounds" || { awgr_error "${LANG[AWGR_PROFILE_UPDATE_ERROR]}"; return 1; }
+    inbounds=$(jq -c --arg uuid "$inbound_uuid" '. + [$uuid] | map(select(length > 0)) | unique' <<< "$inbounds")
 
-    awgr_assign_profile "$node" "$profile" "$inbounds" || { awgr_error "${LANG[AWGR_PROFILE_ASSIGN_ERROR]}"; return 1; }
+    awgr_assign_profile "$node" "$profile" "$inbounds" || { awgr_restore_original_profile "$state" >/dev/null 2>&1 || true; awgr_error "${LANG[AWGR_PROFILE_ASSIGN_ERROR]}"; return 1; }
+
+    # Updating the profile may allocate a new UUID for AWG3_TPROXY_IN. Keep
+    # state.json synchronized so status/rollback always use the current UUIDs.
+    local state_refresh="${AWGR_STATE_FILE}.tmp.$$"
+    if ! jq --arg inboundUuid "$inbound_uuid" --argjson active "$inbounds"         '.xray.inboundUuid=$inboundUuid | .profile.integrationActiveInbounds=$active'         "$AWGR_STATE_FILE" > "$state_refresh"         || ! jq -e 'type == "object" and .version == 5' "$state_refresh" >/dev/null 2>&1         || ! chmod 600 "$state_refresh"         || ! mv -f "$state_refresh" "$AWGR_STATE_FILE"; then
+        rm -f "$state_refresh"
+        awgr_restore_original_profile "$state" >/dev/null 2>&1 || true
+        awgr_error "${LANG[AWGR_STATE_WRITE_ERROR]}"
+        return 1
+    fi
+    state=$(cat "$AWGR_STATE_FILE")
     awgr_restart_node "$node" >/dev/null 2>&1 || true
     if ! awgr_write_tproxy_runtime; then
         awgr_restore_original_profile "$state" >/dev/null 2>&1 || true
@@ -1826,7 +1925,9 @@ remove_amneziawg_remnawave() {
     fi
     awgr_restart_node "$node" >/dev/null 2>&1 || true
     awgr_remove_runtime "$state" false
-    awgr_delete_profile "$integration_uuid" || awgr_warn "${LANG[AWGR_DELETE_PROFILE_WARN]}"
+    if [ "$(echo "$state" | jq -r '.profile.mode // "clone"')" != "in_place" ]; then
+        awgr_delete_profile "$integration_uuid" || awgr_warn "${LANG[AWGR_DELETE_PROFILE_WARN]}"
+    fi
     if ! awgr_rollback_node_net_admin "$docker_compose_file" "$docker_cap_added" "$docker_service"; then
         awgr_warn "${LANG[AWGR_NET_ADMIN_REMOVE_WARN]}"
     fi
