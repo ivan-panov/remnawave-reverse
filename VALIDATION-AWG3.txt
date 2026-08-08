@@ -1,4 +1,4 @@
-Validation report — remnawave-reverse 3.0.1
+Validation report — remnawave-reverse 3.0.2
 Date: 2026-08-07
 Target: Ubuntu Server 24.04 LTS x86_64, Linux kernel 6.7+, KVM/VM
 
