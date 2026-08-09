@@ -1,0 +1,26 @@
+Remnawave Reverse 3.0.14 validation
+Date: 2026-08-09 UTC
+
+Fix target:
+- Installer could stop immediately after "Docker Engine and Docker Compose are ready" when apt-daily/unattended-upgrades acquired dpkg locks asynchronously.
+
+Changes:
+- SCRIPT_VERSION=3.0.14.
+- Added wait_for_apt_ready() for dpkg/apt lock files with a 15-minute timeout and diagnostics.
+- Added apt_get_safe() with DPkg::Lock::Timeout=900.
+- All bootstrap APT operations now wait for transient apt/dpkg locks.
+- After Docker becomes ready the installer explicitly waits for any background APT job and then continues automatically.
+- unattended-upgrades configuration is idempotent and retried instead of aborting on a transient lock.
+- Added RU/EN progress messages so the installer no longer appears to silently stop after Docker installation.
+
+Validation performed:
+PASS - bash -n on all 20 shell files.
+PASS - bootstrap APT commands use apt_get_safe().
+PASS - explicit wait_for_apt_ready() is executed after Docker readiness before BBR/UFW/unattended-upgrades.
+PASS - RU/EN progress and timeout language keys are present exactly once.
+PASS - unattended-upgrades mail setting is idempotent and configuration retries up to 3 times.
+PASS - psmisc is installed so fuser is available for lock diagnostics after base package bootstrap.
+
+Not performed in this environment:
+- Live Ubuntu apt-daily/unattended-upgrades lock contention test.
+- Live Docker installation on the user's VPS.

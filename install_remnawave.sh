@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="3.0.13"
+SCRIPT_VERSION="3.0.14"
 CUSTOM_BUILD=false
 
 # Repository used for installation and self-updates. It can be overridden for
@@ -1337,6 +1337,83 @@ docker_engine_healthy() {
     docker_compose_available || return 1
 }
 
+# APT may start unattended-upgrades/apt-daily immediately after package installation.
+# Never abort the Remnawave installer just because dpkg is temporarily locked.
+apt_lock_busy() {
+    local lock
+    for lock in \
+        /var/lib/dpkg/lock-frontend \
+        /var/lib/dpkg/lock \
+        /var/lib/apt/lists/lock \
+        /var/cache/apt/archives/lock
+    do
+        if [ -e "$lock" ] && fuser "$lock" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+wait_for_apt_ready() {
+    local timeout="${1:-900}"
+    local elapsed=0
+    local interval=5
+    local announced=false
+
+    while apt_lock_busy; do
+        if [ "$announced" = false ]; then
+            echo -e "${COLOR_YELLOW}${LANG[APT_WAIT_LOCK]}${COLOR_RESET}"
+            announced=true
+        fi
+
+        if [ "$elapsed" -ge "$timeout" ]; then
+            echo -e "${COLOR_RED}${LANG[APT_WAIT_TIMEOUT]}${COLOR_RESET}" >&2
+            fuser -v \
+                /var/lib/dpkg/lock-frontend \
+                /var/lib/dpkg/lock \
+                /var/lib/apt/lists/lock \
+                /var/cache/apt/archives/lock 2>/dev/null || true
+            return 1
+        fi
+
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+
+    if [ "$announced" = true ]; then
+        echo -e "${COLOR_GREEN}${LANG[APT_LOCK_RELEASED]}${COLOR_RESET}"
+    fi
+    return 0
+}
+
+apt_get_safe() {
+    wait_for_apt_ready 900 || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=900 "$@"
+}
+
+configure_unattended_upgrades_safe() {
+    local attempt
+
+    if ! grep -qxF 'Unattended-Upgrade::Mail "root";' /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null; then
+        echo 'Unattended-Upgrade::Mail "root";' >> /etc/apt/apt.conf.d/50unattended-upgrades
+    fi
+
+    echo unattended-upgrades unattended-upgrades/enable_auto_updates boolean true | debconf-set-selections
+
+    for attempt in 1 2 3; do
+        wait_for_apt_ready 900 || return 1
+        if DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive unattended-upgrades; then
+            systemctl restart unattended-upgrades >/dev/null 2>&1 || true
+            return 0
+        fi
+
+        echo -e "${COLOR_YELLOW}${LANG[APT_RETRY_CONFIG]} (${attempt}/3)${COLOR_RESET}"
+        sleep 5
+    done
+
+    return 1
+}
+
 install_docker_official_apt() {
     if [ "$(id -u)" -ne 0 ]; then
         echo -e "${COLOR_RED}${LANG[DOCKER_ROOT_REQUIRED]}${COLOR_RESET}" >&2
@@ -1369,8 +1446,8 @@ install_docker_official_apt() {
 
     echo -e "${COLOR_YELLOW}${LANG[DOCKER_INSTALLING]}${COLOR_RESET}"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y || return 1
-    apt-get install -y ca-certificates curl gnupg || return 1
+    apt_get_safe update -y || return 1
+    apt_get_safe install -y ca-certificates curl gnupg || return 1
 
     install -m 0755 -d /etc/apt/keyrings
     local key_tmp
@@ -1393,8 +1470,8 @@ Architectures: ${arch}
 Signed-By: /etc/apt/keyrings/docker.gpg
 EOF
 
-    apt-get update -y || return 1
-    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
+    apt_get_safe update -y || return 1
+    apt_get_safe install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
 
     systemctl daemon-reload
     systemctl enable --now docker || return 1
@@ -1423,8 +1500,8 @@ ensure_docker_ready() {
     if command -v docker >/dev/null 2>&1; then
         systemctl enable --now docker >/dev/null 2>&1 || true
         if ! docker_compose_available; then
-            apt-get update -y >/dev/null 2>&1 || true
-            apt-get install -y docker-compose-plugin >/dev/null 2>&1 || true
+            apt_get_safe update -y >/dev/null 2>&1 || true
+            apt_get_safe install -y docker-compose-plugin >/dev/null 2>&1 || true
         fi
         if docker_engine_healthy; then
             echo -e "${COLOR_GREEN}${LANG[DOCKER_READY]}${COLOR_RESET}"
@@ -1503,18 +1580,18 @@ configure_ufw_safely() {
 install_packages() {
     echo -e "${COLOR_YELLOW}${LANG[INSTALL_PACKAGES]}${COLOR_RESET}"
 
-    if ! apt-get update -y; then
+    if ! apt_get_safe update -y; then
         echo -e "${COLOR_RED}${LANG[ERROR_UPDATE_LIST]}${COLOR_RESET}" >&2
         return 1
     fi
 
-    if ! apt-get install -y ca-certificates curl jq ufw wget gnupg unzip nano dialog git certbot python3-certbot-dns-cloudflare unattended-upgrades locales dnsutils coreutils grep gawk python3-pip; then
+    if ! apt_get_safe install -y ca-certificates curl jq ufw wget gnupg unzip nano dialog git certbot python3-certbot-dns-cloudflare unattended-upgrades locales dnsutils coreutils grep gawk psmisc python3-pip; then
         echo -e "${COLOR_RED}${LANG[ERROR_INSTALL_PACKAGES]}${COLOR_RESET}" >&2
         return 1
     fi
 
     if ! dpkg -l | grep -q '^ii.*cron '; then
-        if ! apt-get install -y cron; then
+        if ! apt_get_safe install -y cron; then
             echo -e "${COLOR_RED}${LANG[ERROR_INSTALL_CRON]}" "${COLOR_RESET}" >&2
             return 1
         fi
@@ -1540,6 +1617,13 @@ install_packages() {
         return 1
     fi
 
+    # Installing Docker can trigger apt-daily/unattended-upgrades asynchronously.
+    # Wait here instead of letting the next dpkg operation terminate installation.
+    echo -e "${COLOR_GREEN}${LANG[DOCKER_CONTINUE_SETUP]}${COLOR_RESET}"
+    if ! wait_for_apt_ready 900; then
+        return 1
+    fi
+
     # BBR
     if ! grep -q "net.core.default_qdisc = fq" /etc/sysctl.conf; then
         echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
@@ -1555,10 +1639,9 @@ install_packages() {
         return 1
     fi
 
-    # Unattended-upgrades
-    echo 'Unattended-Upgrade::Mail "root";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-    echo unattended-upgrades unattended-upgrades/enable_auto_updates boolean true | debconf-set-selections
-    if ! dpkg-reconfigure -f noninteractive unattended-upgrades || ! systemctl restart unattended-upgrades; then
+    # Unattended-upgrades. A background apt job may start after Docker packages are
+    # installed, so wait/retry rather than aborting the whole installer on dpkg lock.
+    if ! configure_unattended_upgrades_safe; then
         echo -e "${COLOR_RED}${LANG[ERROR_CONFIGURE_UPGRADES]}" "${COLOR_RESET}" >&2
         return 1
     fi
