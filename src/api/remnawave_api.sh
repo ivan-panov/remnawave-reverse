@@ -234,42 +234,82 @@ EOF
 get_config_profiles() {
     local domain_url="$1"
     local token="$2"
+    local config_response profile_uuid
 
-    local config_response=$(make_api_request "GET" "http://$domain_url/api/config-profiles" "$token")
-    if [ -z "$config_response" ] || ! echo "$config_response" | jq -e '.' > /dev/null 2>&1; then
-        echo -e "${COLOR_RED}${LANG[ERROR_NO_CONFIGS]}${COLOR_RESET}"
+    config_response=$(make_api_request "GET" "http://$domain_url/api/config-profiles" "$token")
+    if [ -z "$config_response" ] || ! echo "$config_response" | jq -e '.response.configProfiles' > /dev/null 2>&1; then
+        echo -e "${COLOR_RED}${LANG[ERROR_NO_CONFIGS]}${COLOR_RESET}" >&2
         return 1
     fi
 
-    local profile_uuid=$(echo "$config_response" | jq -r '.response.configProfiles[] | select(.name == "Default-Profile") | .uuid' 2>/dev/null)
-    if [ -z "$profile_uuid" ]; then
-        echo -e "${COLOR_YELLOW}${LANG[NO_DEFAULT_PROFILE]}${COLOR_RESET}"
-        return 0
+    profile_uuid=$(echo "$config_response" | jq -r '.response.configProfiles[] | select(.name == "Default-Profile") | .uuid' 2>/dev/null | head -n1)
+    if [ -z "$profile_uuid" ] || [ "$profile_uuid" = "null" ]; then
+        # Important: informational text goes to stderr so command substitution
+        # never mistakes it for a profile UUID.
+        echo -e "${COLOR_YELLOW}${LANG[NO_DEFAULT_PROFILE]}${COLOR_RESET}" >&2
+        return 2
     fi
 
-    echo "$profile_uuid"
+    printf '%s\n' "$profile_uuid"
     return 0
 }
 
 delete_config_profile() {
     local domain_url="$1"
     local token="$2"
-    local profile_uuid="$3"
+    local profile_uuid="${3:-}"
+    local lookup_rc=0
 
     if [ -z "$profile_uuid" ]; then
-        profile_uuid=$(get_config_profiles "$domain_url" "$token")
-        if [ $? -ne 0 ] || [ -z "$profile_uuid" ]; then
-            return 0
-        fi
+        profile_uuid=$(get_config_profiles "$domain_url" "$token") || lookup_rc=$?
+        case "$lookup_rc" in
+            0) ;;
+            2) return 0 ;; # Default-Profile is already absent.
+            *) return 1 ;;
+        esac
     fi
 
-    local delete_response=$(make_api_request "DELETE" "http://$domain_url/api/config-profiles/$profile_uuid" "$token")
-    if [ -z "$delete_response" ] || ! echo "$delete_response" | jq -e '.' > /dev/null 2>&1; then
+    # Never send an informational/error string as a UUID.
+    if ! [[ "$profile_uuid" =~ ^[0-9a-fA-F-]{36}$ ]]; then
         echo -e "${COLOR_RED}${LANG[ERROR_DELETE_PROFILE]}${COLOR_RESET}"
         return 1
     fi
 
-    return 0
+    echo -e "${COLOR_YELLOW}${LANG[DELETING_DEFAULT_PROFILE]}${COLOR_RESET}"
+
+    local response_file http_code curl_rc delete_response
+    response_file=$(mktemp) || return 1
+
+    http_code=$(curl -sS \
+        -o "$response_file" \
+        -w '%{http_code}' \
+        -X DELETE \
+        "http://$domain_url/api/config-profiles/$profile_uuid" \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -H "X-Forwarded-For: 127.0.0.1" \
+        -H "X-Forwarded-Proto: https" \
+        -H "X-Remnawave-Client-Type: browser")
+    curl_rc=$?
+    delete_response=$(cat "$response_file" 2>/dev/null)
+    rm -f "$response_file"
+
+    if [ "$curl_rc" -ne 0 ]; then
+        echo -e "${COLOR_RED}${LANG[ERROR_DELETE_PROFILE]}${COLOR_RESET}"
+        return 1
+    fi
+
+    # Remnawave 3.x commonly returns HTTP 204 No Content for successful DELETE.
+    # Any HTTP 2xx is a successful deletion; the response body may legitimately
+    # be empty and therefore must not be parsed as mandatory JSON.
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        echo -e "${COLOR_GREEN}${LANG[DEFAULT_PROFILE_DELETED]} (HTTP ${http_code})${COLOR_RESET}"
+        return 0
+    fi
+
+    printf "${COLOR_RED}${LANG[ERROR_DELETE_PROFILE_HTTP]}${COLOR_RESET}\n" "$http_code"
+    [ -n "$delete_response" ] && echo "$delete_response"
+    return 1
 }
 
 create_config_profile() {

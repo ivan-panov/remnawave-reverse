@@ -1,0 +1,22 @@
+Remnawave Reverse 3.0.16 validation
+Date: 2026-08-09
+
+Fix target:
+- Default Config Profile deletion falsely reported failure during fresh installation.
+
+Root causes fixed:
+1. get_config_profiles() printed "Default-Profile not found" to stdout. Because the caller used command substitution, that informational text could be captured and treated as a UUID.
+2. delete_config_profile() required a non-empty JSON response. Remnawave 3.x may return HTTP 204 No Content for a successful DELETE, which was incorrectly treated as failure.
+
+Changes:
+- SCRIPT_VERSION=3.0.16.
+- Default-Profile lookup keeps stdout machine-readable (UUID only); informational/error messages go to stderr.
+- Missing Default-Profile is treated as an idempotent success: deletion is not required.
+- Profile UUID is validated before DELETE.
+- DELETE checks HTTP status and accepts any HTTP 2xx, including 204 No Content.
+- Installation now prints an explicit delete-start and delete-success message with the HTTP status.
+- Non-2xx DELETE responses remain errors and show the HTTP status/body.
+
+Validation:
+- bash -n run on all shell files.
+- ZIP integrity tested with unzip -t.
