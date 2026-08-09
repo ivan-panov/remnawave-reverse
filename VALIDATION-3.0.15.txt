@@ -1,0 +1,16 @@
+Remnawave Reverse 3.0.15 validation
+Date: 2026-08-09
+
+Fix target:
+- The Panel+Node installation warning confirmation did not show the accepted y/n choices in the prompt.
+
+Changes:
+- SCRIPT_VERSION=3.0.15.
+- Russian prompt is now: "Продолжить? (y/n):"
+- English prompt is now: "Continue? (y/n):"
+- Existing input handling remains unchanged: y/Y continues, any other answer returns to the install menu.
+- All 3.0.14 Docker/APT lock handling changes are preserved.
+
+Validation performed:
+PASS - bash -n on 20 shell files.
+PASS - version and RU/EN confirmation prompts verified.
